@@ -1,0 +1,21 @@
+[project]
+name = "gsheets-mcp"
+version = "0.1.0"
+description = "Standalone MCP server for Google Sheets operations"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "google-api-python-client>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-auth-httplib2>=0.1.0",
+]
+
+[project.scripts]
+gsheets-mcp = "src.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

@@ -1,0 +1,1 @@
+"""gsheets-mcp package."""
