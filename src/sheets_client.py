@@ -1,5 +1,6 @@
 """Google Sheets and Drive helpers for gsheets-mcp."""
 
+import logging
 import pickle
 import re
 from pathlib import Path
@@ -32,6 +33,7 @@ CREDENTIALS_FILE = BASE_DIR / "drive_credentials.json"
 TOKEN_FILE = BASE_DIR / "token.pickle"
 
 _cached_creds = None
+logger = logging.getLogger(__name__)
 
 
 def _get_missing_scopes(creds) -> list[str]:
@@ -314,4 +316,39 @@ def clear_sheet_range(sheets_service, spreadsheet_id: str, range_a1: str) -> dic
     ).execute()
     return {
         "clearedRange": result.get("clearedRange", range_a1),
+    }
+
+
+def touch_sheet_range(sheets_service, spreadsheet_id: str, range_a1: str) -> dict:
+    """Force custom-function recalculation by clearing and rewriting a range."""
+    original_values = read_sheet_range(
+        sheets_service,
+        spreadsheet_id,
+        range_a1,
+        value_render_option="FORMULA",
+    )
+    if not original_values:
+        return {"touchedRange": range_a1, "touchedCells": 0}
+
+    clear_sheet_range(sheets_service, spreadsheet_id, range_a1)
+    try:
+        updated = update_sheet_range(
+            sheets_service,
+            spreadsheet_id,
+            range_a1,
+            original_values,
+            value_input_option="USER_ENTERED",
+        )
+    except Exception:
+        logger.warning(
+            "touch_sheet_range update failed after clear; spreadsheet_id=%s range=%s original_values=%r",
+            spreadsheet_id,
+            range_a1,
+            original_values,
+        )
+        raise
+
+    return {
+        "touchedRange": updated.get("updatedRange", range_a1),
+        "touchedCells": updated.get("updatedCells", 0),
     }

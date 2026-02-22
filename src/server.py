@@ -10,7 +10,7 @@ mcp = FastMCP(
     "gsheets-mcp",
     instructions=(
         "Google Sheets tools for tab listing, range reads/writes, search, "
-        "sheet creation, and range clearing."
+        "sheet creation, range clearing, and range touch/recalc."
     ),
 )
 
@@ -204,6 +204,29 @@ def gsheet_clear_range(spreadsheet: str, cell_range: str) -> str:
         )
     except Exception as exc:
         return _json_error("gsheet_clear_range", exc)
+
+
+@mcp.tool()
+def gsheet_touch_range(spreadsheet: str, cell_range: str) -> str:
+    """Touch a range to force recalculation of custom functions. Reads formulas, clears the range, then rewrites them."""
+    try:
+        spreadsheet_id, _ = sheets_client.resolve_spreadsheet_id(spreadsheet)
+        sheets_service = sheets_client.get_sheets_service()
+        touch_result = sheets_client.touch_sheet_range(
+            sheets_service,
+            spreadsheet_id,
+            cell_range,
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "spreadsheet_id": spreadsheet_id,
+                "touchedRange": touch_result.get("touchedRange", cell_range),
+                "touchedCells": touch_result.get("touchedCells", 0),
+            }
+        )
+    except Exception as exc:
+        return _json_error("gsheet_touch_range", exc)
 
 
 def main() -> None:

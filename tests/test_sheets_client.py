@@ -195,3 +195,73 @@ def test_clear_range_calls_api() -> None:
         body={},
     )
     assert result["clearedRange"] == "Sheet1!A1:C10"
+
+
+def test_touch_sheet_range_reads_clears_and_rewrites_in_order() -> None:
+    sheets_service = MagicMock()
+    values_api = sheets_service.spreadsheets.return_value.values.return_value
+    call_order: list[str] = []
+
+    def _record_read():
+        call_order.append("read")
+        return {"values": [["=SF(\"AAPL\",\"income\",\"revenue\")", 42], ["foo", "bar"]]}
+
+    def _record_clear():
+        call_order.append("clear")
+        return {"clearedRange": "Sheet1!A1:B2"}
+
+    def _record_update():
+        call_order.append("update")
+        return {"updatedRange": "Sheet1!A1:B2", "updatedCells": 4}
+
+    values_api.get.return_value.execute.side_effect = _record_read
+    values_api.clear.return_value.execute.side_effect = _record_clear
+    values_api.update.return_value.execute.side_effect = _record_update
+
+    result = sheets_client.touch_sheet_range(
+        sheets_service,
+        spreadsheet_id="sheet-123",
+        range_a1="Sheet1!A1:B2",
+    )
+
+    assert call_order == ["read", "clear", "update"]
+    values_api.get.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="Sheet1!A1:B2",
+        valueRenderOption="FORMULA",
+        dateTimeRenderOption="FORMATTED_STRING",
+    )
+    values_api.clear.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="Sheet1!A1:B2",
+        body={},
+    )
+    values_api.update.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="Sheet1!A1:B2",
+        valueInputOption="USER_ENTERED",
+        body={"values": [["=SF(\"AAPL\",\"income\",\"revenue\")", 42], ["foo", "bar"]]},
+    )
+    assert result == {"touchedRange": "Sheet1!A1:B2", "touchedCells": 4}
+
+
+def test_touch_sheet_range_empty_range_returns_without_writes() -> None:
+    sheets_service = MagicMock()
+    values_api = sheets_service.spreadsheets.return_value.values.return_value
+    values_api.get.return_value.execute.return_value = {"values": []}
+
+    result = sheets_client.touch_sheet_range(
+        sheets_service,
+        spreadsheet_id="sheet-123",
+        range_a1="Sheet1!A1:B2",
+    )
+
+    values_api.get.assert_called_once_with(
+        spreadsheetId="sheet-123",
+        range="Sheet1!A1:B2",
+        valueRenderOption="FORMULA",
+        dateTimeRenderOption="FORMATTED_STRING",
+    )
+    values_api.clear.assert_not_called()
+    values_api.update.assert_not_called()
+    assert result == {"touchedRange": "Sheet1!A1:B2", "touchedCells": 0}
