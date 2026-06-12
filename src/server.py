@@ -10,7 +10,7 @@ mcp = FastMCP(
     "gsheets-mcp",
     instructions=(
         "Google Sheets tools for tab listing, range reads/writes, search, "
-        "sheet creation, range clearing, and range touch/recalc."
+        "sheet creation/copying, range clearing, and range touch/recalc."
     ),
 )
 
@@ -222,6 +222,48 @@ def gsheet_create(title: str) -> str:
         )
     except Exception as exc:
         return _json_error("gsheet_create", exc)
+
+
+@mcp.tool()
+def gsheet_copy_spreadsheet(
+    source: str,
+    new_title: str,
+    tabs: list[str] | None = None,
+) -> str:
+    """Copy all or selected tabs from one spreadsheet into a new spreadsheet.
+
+    Discovery: run gsheet_search first when you only know a spreadsheet title
+    or partial name, then pass the returned spreadsheet_id or exact name as
+    source. Use gsheet_list_tabs first when passing tabs so the names match
+    exactly.
+
+    Sibling tools: after copying, use gsheet_update_range to swap inputs,
+    gsheet_touch_range to force custom-function recalculation, and
+    gsheet_read_range to inspect copied values or formulas.
+
+    Common mistake: this creates a new spreadsheet file. It does not duplicate
+    a tab inside the source spreadsheet, and tabs must be tab names, not ranges.
+    """
+    try:
+        source_spreadsheet_id, _ = sheets_client.resolve_spreadsheet_id(source)
+        sheets_service = sheets_client.get_sheets_service()
+        copy_result = sheets_client.copy_spreadsheet(
+            sheets_service,
+            source_spreadsheet_id,
+            new_title,
+            tabs=tabs,
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "spreadsheet_id": copy_result.get("spreadsheet_id", ""),
+                "title": copy_result.get("title", new_title),
+                "url": copy_result.get("url", ""),
+                "copied_tabs": copy_result.get("copied_tabs", []),
+            }
+        )
+    except Exception as exc:
+        return _json_error("gsheet_copy_spreadsheet", exc)
 
 
 @mcp.tool()

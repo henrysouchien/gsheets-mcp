@@ -173,11 +173,14 @@ def resolve_spreadsheet_id(name_or_id: str) -> tuple[str, str]:
     raise ValueError("\n".join(candidates))
 
 
-def list_sheet_tabs(sheets_service, spreadsheet_id: str) -> list[dict]:
-    """List tabs in a spreadsheet."""
+def _list_sheet_properties(sheets_service, spreadsheet_id: str) -> list[dict]:
+    """List tab properties in a spreadsheet, including sheet IDs."""
     spreadsheet = sheets_service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
-        fields="sheets(properties(title,index,gridProperties(rowCount,columnCount)))",
+        fields=(
+            "sheets(properties(sheetId,title,index,"
+            "gridProperties(rowCount,columnCount)))"
+        ),
     ).execute()
 
     tabs = []
@@ -186,10 +189,26 @@ def list_sheet_tabs(sheets_service, spreadsheet_id: str) -> list[dict]:
         grid = props.get("gridProperties", {})
         tabs.append(
             {
+                "sheetId": props.get("sheetId", 0),
                 "title": props.get("title", ""),
                 "index": props.get("index", 0),
                 "rowCount": grid.get("rowCount", 0),
                 "columnCount": grid.get("columnCount", 0),
+            }
+        )
+    return tabs
+
+
+def list_sheet_tabs(sheets_service, spreadsheet_id: str) -> list[dict]:
+    """List tabs in a spreadsheet."""
+    tabs = []
+    for tab in _list_sheet_properties(sheets_service, spreadsheet_id):
+        tabs.append(
+            {
+                "title": tab["title"],
+                "index": tab["index"],
+                "rowCount": tab["rowCount"],
+                "columnCount": tab["columnCount"],
             }
         )
     return tabs
@@ -283,6 +302,109 @@ def create_spreadsheet(sheets_service, title: str) -> tuple[str, str]:
         fields="spreadsheetId,spreadsheetUrl",
     ).execute()
     return result.get("spreadsheetId", ""), result.get("spreadsheetUrl", "")
+
+
+def copy_spreadsheet(
+    sheets_service,
+    source_spreadsheet_id: str,
+    new_title: str,
+    tabs: list[str] | None = None,
+) -> dict:
+    """Copy selected tabs into a new spreadsheet with the original tab names."""
+    if not new_title:
+        raise ValueError("new_title must be non-empty")
+
+    requested_tabs: set[str] | None = None
+    if tabs is not None:
+        if (
+            not isinstance(tabs, list)
+            or not tabs
+            or any(not isinstance(tab, str) or not tab for tab in tabs)
+        ):
+            raise ValueError("tabs must be a non-empty list of tab names when provided")
+        duplicate_tabs = sorted({tab for tab in tabs if tabs.count(tab) > 1})
+        if duplicate_tabs:
+            raise ValueError(
+                f"tabs contains duplicate tab names: {', '.join(duplicate_tabs)}"
+            )
+        requested_tabs = set(tabs)
+
+    source_tabs = _list_sheet_properties(sheets_service, source_spreadsheet_id)
+    if not source_tabs:
+        raise ValueError("Source spreadsheet has no tabs")
+
+    if requested_tabs is None:
+        selected_tabs = source_tabs
+    else:
+        selected_tabs = [tab for tab in source_tabs if tab["title"] in requested_tabs]
+        selected_titles = {tab["title"] for tab in selected_tabs}
+        missing_tabs = [tab for tab in tabs or [] if tab not in selected_titles]
+        if missing_tabs:
+            raise ValueError(f"Requested tabs not found: {', '.join(missing_tabs)}")
+
+    create_result = sheets_service.spreadsheets().create(
+        body={"properties": {"title": new_title}},
+        fields="spreadsheetId,spreadsheetUrl,sheets(properties(sheetId,title,index))",
+    ).execute()
+    new_spreadsheet_id = create_result.get("spreadsheetId", "")
+    spreadsheet_url = create_result.get("spreadsheetUrl", "")
+    if not new_spreadsheet_id:
+        raise ValueError("Sheets API did not return a new spreadsheet ID")
+
+    default_sheet_id = None
+    for sheet in create_result.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == "Sheet1":
+            default_sheet_id = props.get("sheetId")
+            break
+    if default_sheet_id is None:
+        raise ValueError("Created spreadsheet default Sheet1 tab was not found")
+
+    copied_tabs = []
+    for source_tab in selected_tabs:
+        copied_props = sheets_service.spreadsheets().sheets().copyTo(
+            spreadsheetId=source_spreadsheet_id,
+            sheetId=source_tab["sheetId"],
+            body={"destinationSpreadsheetId": new_spreadsheet_id},
+        ).execute()
+        copied_sheet_id = copied_props.get("sheetId")
+        if copied_sheet_id is None:
+            raise ValueError(
+                f"Sheets API did not return copied sheet ID for tab {source_tab['title']}"
+            )
+        copied_tabs.append(
+            {
+                "source_title": source_tab["title"],
+                "copied_sheet_id": copied_sheet_id,
+            }
+        )
+
+    batch_requests = [{"deleteSheet": {"sheetId": default_sheet_id}}]
+    for index, copied_tab in enumerate(copied_tabs):
+        batch_requests.append(
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": copied_tab["copied_sheet_id"],
+                        "title": copied_tab["source_title"],
+                        "index": index,
+                    },
+                    "fields": "title,index",
+                }
+            }
+        )
+
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=new_spreadsheet_id,
+        body={"requests": batch_requests},
+    ).execute()
+
+    return {
+        "spreadsheet_id": new_spreadsheet_id,
+        "title": new_title,
+        "url": spreadsheet_url,
+        "copied_tabs": [copied_tab["source_title"] for copied_tab in copied_tabs],
+    }
 
 
 def search_spreadsheets(

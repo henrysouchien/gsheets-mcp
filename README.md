@@ -11,6 +11,7 @@ MCP server for Google Sheets operations.
 | `gsheet_update_range` | Update a range with user-entered values |
 | `gsheet_append_rows` | Append rows to a range |
 | `gsheet_create` | Create a new spreadsheet |
+| `gsheet_copy_spreadsheet` | Copy all or selected tabs into a new spreadsheet |
 | `gsheet_search` | Search Drive for spreadsheets by name |
 | `gsheet_clear_range` | Clear all values in a range |
 | `gsheet_touch_range` | Rewrite formulas in a range to trigger recalculation |

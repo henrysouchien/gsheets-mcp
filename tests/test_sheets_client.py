@@ -176,6 +176,173 @@ def test_search_spreadsheets_escapes_apostrophes() -> None:
     assert "O\\'Reilly" in list_kwargs["q"]
 
 
+def test_copy_spreadsheet_copies_all_tabs_and_renames_in_order() -> None:
+    sheets_service = MagicMock()
+    spreadsheets_api = sheets_service.spreadsheets.return_value
+    sheets_api = spreadsheets_api.sheets.return_value
+    call_order: list[str] = []
+
+    def fake_get(**kwargs):
+        call_order.append("get")
+        request = MagicMock()
+        request.execute.return_value = {
+            "sheets": [
+                {
+                    "properties": {
+                        "sheetId": 101,
+                        "title": "Comps",
+                        "index": 0,
+                        "gridProperties": {"rowCount": 20, "columnCount": 8},
+                    }
+                },
+                {
+                    "properties": {
+                        "sheetId": 102,
+                        "title": "Assumptions",
+                        "index": 1,
+                        "gridProperties": {"rowCount": 10, "columnCount": 4},
+                    }
+                },
+            ]
+        }
+        return request
+
+    def fake_create(**kwargs):
+        call_order.append("create")
+        request = MagicMock()
+        request.execute.return_value = {
+            "spreadsheetId": "new-sheet",
+            "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/new-sheet",
+            "sheets": [{"properties": {"sheetId": 900, "title": "Sheet1", "index": 0}}],
+        }
+        return request
+
+    copied_props = iter(
+        [
+            {"sheetId": 201, "title": "Copy of Comps", "index": 1},
+            {"sheetId": 202, "title": "Copy of Assumptions", "index": 2},
+        ]
+    )
+
+    def fake_copy_to(*, spreadsheetId, sheetId, body):
+        call_order.append(f"copyTo:{sheetId}")
+        request = MagicMock()
+        request.execute.return_value = next(copied_props)
+        return request
+
+    def fake_batch_update(**kwargs):
+        call_order.append("batchUpdate")
+        request = MagicMock()
+        request.execute.return_value = {}
+        return request
+
+    spreadsheets_api.get.side_effect = fake_get
+    spreadsheets_api.create.side_effect = fake_create
+    sheets_api.copyTo.side_effect = fake_copy_to
+    spreadsheets_api.batchUpdate.side_effect = fake_batch_update
+
+    result = sheets_client.copy_spreadsheet(
+        sheets_service,
+        source_spreadsheet_id="source-sheet",
+        new_title="[hank] HCM Comps",
+    )
+
+    assert call_order == ["get", "create", "copyTo:101", "copyTo:102", "batchUpdate"]
+    spreadsheets_api.create.assert_called_once_with(
+        body={"properties": {"title": "[hank] HCM Comps"}},
+        fields="spreadsheetId,spreadsheetUrl,sheets(properties(sheetId,title,index))",
+    )
+    spreadsheets_api.batchUpdate.assert_called_once_with(
+        spreadsheetId="new-sheet",
+        body={
+            "requests": [
+                {"deleteSheet": {"sheetId": 900}},
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": 201,
+                            "title": "Comps",
+                            "index": 0,
+                        },
+                        "fields": "title,index",
+                    }
+                },
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": 202,
+                            "title": "Assumptions",
+                            "index": 1,
+                        },
+                        "fields": "title,index",
+                    }
+                },
+            ]
+        },
+    )
+    assert result == {
+        "spreadsheet_id": "new-sheet",
+        "title": "[hank] HCM Comps",
+        "url": "https://docs.google.com/spreadsheets/d/new-sheet",
+        "copied_tabs": ["Comps", "Assumptions"],
+    }
+
+
+def test_copy_spreadsheet_tabs_subset_preserves_source_order() -> None:
+    sheets_service = MagicMock()
+    spreadsheets_api = sheets_service.spreadsheets.return_value
+    sheets_api = spreadsheets_api.sheets.return_value
+    copied_sheet_ids: list[int] = []
+
+    spreadsheets_api.get.return_value.execute.return_value = {
+        "sheets": [
+            {"properties": {"sheetId": 11, "title": "Comps", "index": 0}},
+            {"properties": {"sheetId": 22, "title": "Summary", "index": 1}},
+            {"properties": {"sheetId": 33, "title": "Raw Data", "index": 2}},
+        ]
+    }
+    spreadsheets_api.create.return_value.execute.return_value = {
+        "spreadsheetId": "new-sheet",
+        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/new-sheet",
+        "sheets": [{"properties": {"sheetId": 90, "title": "Sheet1", "index": 0}}],
+    }
+    copied_props = iter(
+        [
+            {"sheetId": 111, "title": "Copy of Comps", "index": 1},
+            {"sheetId": 222, "title": "Copy of Summary", "index": 2},
+        ]
+    )
+
+    def fake_copy_to(*, spreadsheetId, sheetId, body):
+        copied_sheet_ids.append(sheetId)
+        request = MagicMock()
+        request.execute.return_value = next(copied_props)
+        return request
+
+    sheets_api.copyTo.side_effect = fake_copy_to
+
+    result = sheets_client.copy_spreadsheet(
+        sheets_service,
+        source_spreadsheet_id="source-sheet",
+        new_title="[hank] HCM Comps",
+        tabs=["Summary", "Comps"],
+    )
+
+    assert copied_sheet_ids == [11, 22]
+    assert result["copied_tabs"] == ["Comps", "Summary"]
+    batch_body = spreadsheets_api.batchUpdate.call_args.kwargs["body"]
+    assert batch_body["requests"][1]["updateSheetProperties"]["properties"] == {
+        "sheetId": 111,
+        "title": "Comps",
+        "index": 0,
+    }
+    assert batch_body["requests"][2]["updateSheetProperties"]["properties"] == {
+        "sheetId": 222,
+        "title": "Summary",
+        "index": 1,
+    }
+
+
 def test_clear_range_calls_api() -> None:
     sheets_service = MagicMock()
     clear_execute = (
