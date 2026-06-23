@@ -1,5 +1,6 @@
 """Unit tests for gsheets-mcp Sheets client helpers."""
 
+import importlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,22 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import sheets_client
+
+
+def test_google_sheet_credential_paths_can_be_overridden_by_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_CREDENTIALS_FILE", "/tmp/gsheets-credentials.json")
+    monkeypatch.setenv("GOOGLE_TOKEN_FILE", "/tmp/gsheets-token.pickle")
+    reloaded = importlib.reload(sheets_client)
+
+    try:
+        assert reloaded.CREDENTIALS_FILE == Path("/tmp/gsheets-credentials.json")
+        assert reloaded.TOKEN_FILE == Path("/tmp/gsheets-token.pickle")
+    finally:
+        monkeypatch.delenv("GOOGLE_CREDENTIALS_FILE", raising=False)
+        monkeypatch.delenv("GOOGLE_TOKEN_FILE", raising=False)
+        importlib.reload(sheets_client)
 
 
 def _http_404_error() -> Exception:

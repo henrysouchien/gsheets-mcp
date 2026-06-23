@@ -1,6 +1,7 @@
 """Google Sheets and Drive helpers for gsheets-mcp."""
 
 import logging
+import os
 import pickle
 import re
 from pathlib import Path
@@ -29,8 +30,10 @@ VALID_DATETIME_RENDER_OPTIONS = {
 }
 
 BASE_DIR = Path(__file__).parent.parent
-CREDENTIALS_FILE = BASE_DIR / "drive_credentials.json"
-TOKEN_FILE = BASE_DIR / "token.pickle"
+CREDENTIALS_FILE = Path(
+    os.environ.get("GOOGLE_CREDENTIALS_FILE") or BASE_DIR / "drive_credentials.json"
+)
+TOKEN_FILE = Path(os.environ.get("GOOGLE_TOKEN_FILE") or BASE_DIR / "token.pickle")
 
 _cached_creds = None
 logger = logging.getLogger(__name__)
