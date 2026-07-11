@@ -205,9 +205,10 @@ def test_copy_401_retries_only_copy_request(monkeypatch):
     def respond(method, uri, body):
         nonlocal copy_attempts
         if method == "GET":
-            if "namedRanges" in uri:
-                return 200, {"properties": {}}
-            return 200, {"sheets": [{"properties": {"sheetId": 101, "title": "Data", "index": 0}}]}
+            return 200, {
+                "properties": {},
+                "sheets": [{"properties": {"sheetId": 101, "title": "Data", "index": 0}}],
+            }
         if method == "POST" and "/v4/spreadsheets?" in uri:
             return 200, {"spreadsheetId": "destination", "spreadsheetUrl": "url", "sheets": [{"properties": {"sheetId": 900, "title": "Sheet1"}}]}
         if ":copyTo" in uri:
@@ -359,6 +360,12 @@ def test_broker_resolve_title_and_malformed_url_are_typed():
     for address in (
         "https://docs.google.com@evil.com/spreadsheets/d/abc1234567890XYZ___123",
         "https://docs.google.com:8443/spreadsheets/d/abc1234567890XYZ___123",
+        # non-numeric port must be a typed error, not an escaping ValueError
+        "https://docs.google.com:bad/spreadsheets/d/abc1234567890XYZ___123",
+        # traversal-shaped suffix after a valid ID must not pass path validation
+        "https://docs.google.com/spreadsheets/d/abc1234567890XYZ___123/../d/other7890123456789012",
+        # unknown suffix segments are rejected (allowlist: edit/view/preview/copy/htmlview)
+        "https://docs.google.com/spreadsheets/d/abc1234567890XYZ___123/export",
     ):
         with pytest.raises(sheets_client.SheetsClientError) as unsafe_url_error:
             sheets_client.resolve_spreadsheet_id(address)

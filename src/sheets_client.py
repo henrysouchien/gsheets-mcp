@@ -30,7 +30,12 @@ GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 SPREADSHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 # Real Sheets URLs may carry an account-qualifier segment (/u/<n>/) between
 # /spreadsheets/ and /d/ when the browser session has multiple Google accounts.
-SPREADSHEET_URL_PATH_PATTERN = re.compile(r"^/spreadsheets/(?:u/\d+/)?d/([A-Za-z0-9_-]+)")
+# The suffix after the ID is anchored to the known UI endpoints so
+# traversal-shaped paths (/d/<id>/../d/<other>) cannot pass validation.
+SPREADSHEET_URL_PATH_PATTERN = re.compile(
+    r"^/spreadsheets/(?:u/\d+/)?d/([A-Za-z0-9_-]+)"
+    r"(?:/(?:edit|view|preview|copy|htmlview))?/?$"
+)
 BROKER_REFRESH_MARGIN_SECONDS = 60
 
 VALID_VALUE_RENDER_OPTIONS = {
@@ -245,12 +250,16 @@ def resolve_spreadsheet_id(name_or_id: str) -> tuple[str, str]:
         parsed = urlparse(name_or_id)
         if parsed.scheme or parsed.netloc:
             path_match = SPREADSHEET_URL_PATH_PATTERN.match(parsed.path)
+            try:
+                port = parsed.port
+            except ValueError:
+                port = -1  # non-numeric port text: treat as invalid, not a crash
             if (
                 parsed.scheme != "https"
                 or parsed.hostname != "docs.google.com"
                 or parsed.username is not None
                 or parsed.password is not None
-                or parsed.port is not None
+                or port is not None
                 or path_match is None
             ):
                 raise SheetsClientError(
@@ -347,16 +356,22 @@ def resolve_spreadsheet_id(name_or_id: str) -> tuple[str, str]:
     raise ValueError("\n".join(candidates))
 
 
+SHEET_PROPERTIES_FIELDS = (
+    "sheets(properties(sheetId,title,index,"
+    "gridProperties(rowCount,columnCount)))"
+)
+
+
 def _list_sheet_properties(sheets_service, spreadsheet_id: str) -> list[dict]:
     """List tab properties in a spreadsheet, including sheet IDs."""
     spreadsheet = sheets_service.spreadsheets().get(
         spreadsheetId=spreadsheet_id,
-        fields=(
-            "sheets(properties(sheetId,title,index,"
-            "gridProperties(rowCount,columnCount)))"
-        ),
+        fields=SHEET_PROPERTIES_FIELDS,
     ).execute()
+    return _parse_sheet_properties(spreadsheet)
 
+
+def _parse_sheet_properties(spreadsheet: dict) -> list[dict]:
     tabs = []
     for sheet in spreadsheet.get("sheets", []):
         props = sheet.get("properties", {})
@@ -503,16 +518,17 @@ def copy_spreadsheet(
             )
         requested_tabs = set(tabs)
 
-    source_tabs = _list_sheet_properties(sheets_service, source_spreadsheet_id)
-    if not source_tabs:
-        raise ValueError("Source spreadsheet has no tabs")
-
     # Tab-level copyTo cannot carry spreadsheet-level objects; the per-user
     # OAuth spec (§5) requires surfacing that gap instead of degrading silently.
+    # One combined read keeps the request count identical to the pre-warning
+    # implementation, so no new failure point is introduced.
     source_meta = sheets_service.spreadsheets().get(
         spreadsheetId=source_spreadsheet_id,
-        fields="properties(locale,timeZone),namedRanges(name)",
+        fields=f"properties(locale,timeZone),namedRanges(name),{SHEET_PROPERTIES_FIELDS}",
     ).execute()
+    source_tabs = _parse_sheet_properties(source_meta)
+    if not source_tabs:
+        raise ValueError("Source spreadsheet has no tabs")
 
     if requested_tabs is None:
         selected_tabs = source_tabs

@@ -264,7 +264,7 @@ def test_copy_spreadsheet_copies_all_tabs_and_renames_in_order() -> None:
         new_title="[hank] HCM Comps",
     )
 
-    assert call_order == ["get", "get", "create", "copyTo:101", "copyTo:102", "batchUpdate"]
+    assert call_order == ["get", "create", "copyTo:101", "copyTo:102", "batchUpdate"]
     spreadsheets_api.create.assert_called_once_with(
         body={"properties": {"title": "[hank] HCM Comps"}},
         fields="spreadsheetId,spreadsheetUrl,properties(locale,timeZone),sheets(properties(sheetId,title,index))",
@@ -457,25 +457,24 @@ def _copy_service(named_ranges, source_props, copy_props):
     spreadsheets = service.spreadsheets.return_value
 
     def fake_get(*, spreadsheetId, fields):
+        assert "sheets(properties" in fields and "namedRanges(name)" in fields, (
+            "copy_spreadsheet must fetch tabs + spreadsheet-level metadata in ONE get"
+        )
         request = MagicMock()
-        if fields.startswith("sheets("):
-            request.execute.return_value = {
-                "sheets": [
-                    {
-                        "properties": {
-                            "sheetId": 11,
-                            "title": "Tab1",
-                            "index": 0,
-                            "gridProperties": {"rowCount": 10, "columnCount": 5},
-                        }
+        request.execute.return_value = {
+            "properties": source_props,
+            "namedRanges": [{"name": name} for name in named_ranges],
+            "sheets": [
+                {
+                    "properties": {
+                        "sheetId": 11,
+                        "title": "Tab1",
+                        "index": 0,
+                        "gridProperties": {"rowCount": 10, "columnCount": 5},
                     }
-                ]
-            }
-        else:
-            request.execute.return_value = {
-                "properties": source_props,
-                "namedRanges": [{"name": name} for name in named_ranges],
-            }
+                }
+            ],
+        }
         return request
 
     spreadsheets.get.side_effect = fake_get
