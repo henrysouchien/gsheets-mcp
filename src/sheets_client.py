@@ -1,12 +1,18 @@
 """Google Sheets and Drive helpers for gsheets-mcp."""
 
 import logging
+import json
 import os
 import pickle
 import re
+import time
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import urljoin, urlparse
 
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -18,6 +24,7 @@ SCOPES = [
 
 GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 SPREADSHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+BROKER_REFRESH_MARGIN_SECONDS = 60
 
 VALID_VALUE_RENDER_OPTIONS = {
     "FORMATTED_VALUE",
@@ -36,7 +43,90 @@ CREDENTIALS_FILE = Path(
 TOKEN_FILE = Path(os.environ.get("GOOGLE_TOKEN_FILE") or BASE_DIR / "token.pickle")
 
 _cached_creds = None
+_cached_broker_expires_at = 0
 logger = logging.getLogger(__name__)
+
+
+class SheetsClientError(RuntimeError):
+    """Typed, user-safe error surfaced by MCP tools."""
+
+    def __init__(self, code: str, message: str, **details) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+
+def is_broker_mode() -> bool:
+    return os.environ.get("GSHEETS_TOKEN_MODE", "").strip().lower() == "broker"
+
+
+def invalidate_broker_credentials() -> None:
+    """Discard only in-memory broker credentials after a Google 401."""
+    global _cached_creds, _cached_broker_expires_at
+    _cached_creds = None
+    _cached_broker_expires_at = 0
+
+
+def _broker_error(code: str, payload: dict | None = None) -> SheetsClientError:
+    payload = payload or {}
+    if code == "sheets_not_connected":
+        return SheetsClientError(
+            code,
+            "Google Sheets is not connected; connect Google Sheets in Hank settings.",
+        )
+    if code == "broker_rate_limited":
+        retry_after = payload.get("retry_after_s")
+        return SheetsClientError(
+            code,
+            f"Google Sheets token broker rate limited this call; retry_after_s={retry_after}.",
+            retry_after_s=retry_after,
+        )
+    if code in {"auth_failed", "broker_session_expired"}:
+        return SheetsClientError(
+            "broker_session_expired",
+            "broker_session_expired: Google Sheets session expired; the gateway must respawn this tool.",
+        )
+    return SheetsClientError(
+        "sheets_unavailable",
+        "Google Sheets is temporarily unavailable.",
+    )
+
+
+def _fetch_broker_credentials() -> tuple[Credentials, int]:
+    base_url = os.environ.get("GSHEETS_BROKER_URL", "").strip()
+    session_token = os.environ.get("GSHEETS_BROKER_SESSION_TOKEN", "").strip()
+    if not base_url or not session_token:
+        raise SheetsClientError(
+            "sheets_unavailable",
+            "Google Sheets broker configuration is unavailable.",
+        )
+    endpoint = urljoin(base_url.rstrip("/") + "/", "api/internal/google/sheets-access-token")
+    req = urllib_request.Request(
+        endpoint,
+        data=b"{}",
+        headers={
+            "Authorization": f"Bearer {session_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=10) as response:
+            payload = json.loads(response.read())
+    except urllib_error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read())
+        except (ValueError, TypeError):
+            payload = {}
+        raise _broker_error(str(payload.get("error") or "sheets_unavailable"), payload) from None
+    except (urllib_error.URLError, TimeoutError, OSError, ValueError):
+        raise _broker_error("sheets_unavailable") from None
+
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    expires_at = payload.get("expires_at") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token or isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        raise _broker_error("sheets_unavailable")
+    return Credentials(token=token), int(expires_at)
 
 
 def _get_missing_scopes(creds) -> list[str]:
@@ -49,9 +139,33 @@ def _get_missing_scopes(creds) -> list[str]:
     return [scope for scope in SCOPES if scope not in granted]
 
 
+def _run_installed_app_flow():
+    """Run local-dev interactive consent; never called by broker mode."""
+    if os.environ.get("GSHEETS_HEADLESS") == "1":
+        raise SheetsClientError(
+            "interactive_consent_disabled",
+            "Interactive Google consent is disabled in headless mode.",
+        )
+    if not CREDENTIALS_FILE.exists():
+        raise FileNotFoundError(
+            f"Credentials file not found at {CREDENTIALS_FILE}. "
+            "Please copy your drive_credentials.json to the gsheets-mcp folder."
+        )
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
+    return flow.run_local_server(port=0)
+
+
 def _get_credentials():
     """Load, refresh, or create OAuth credentials with required scopes."""
-    global _cached_creds
+    global _cached_creds, _cached_broker_expires_at
+
+    if is_broker_mode():
+        if (
+            _cached_creds is None
+            or _cached_broker_expires_at - int(time.time()) <= BROKER_REFRESH_MARGIN_SECONDS
+        ):
+            _cached_creds, _cached_broker_expires_at = _fetch_broker_credentials()
+        return _cached_creds
 
     creds = _cached_creds
     if creds is None and TOKEN_FILE.exists():
@@ -68,18 +182,10 @@ def _get_credentials():
     should_save_token = False
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            creds.refresh(GoogleAuthRequest())
             should_save_token = True
         else:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError(
-                    f"Credentials file not found at {CREDENTIALS_FILE}. "
-                    "Please copy your drive_credentials.json to the gsheets-mcp folder."
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_FILE), SCOPES
-            )
-            creds = flow.run_local_server(port=0)
+            creds = _run_installed_app_flow()
             should_save_token = True
 
     if should_save_token:
@@ -104,6 +210,38 @@ def get_sheets_service():
 
 def resolve_spreadsheet_id(name_or_id: str) -> tuple[str, str]:
     """Resolve a spreadsheet by ID or exact name and return (id, title)."""
+    if is_broker_mode():
+        spreadsheet_id = name_or_id
+        parsed = urlparse(name_or_id)
+        if parsed.scheme or parsed.netloc:
+            if (
+                parsed.scheme != "https"
+                or parsed.netloc != "docs.google.com"
+                or not parsed.path.startswith("/spreadsheets/d/")
+            ):
+                raise SheetsClientError(
+                    "invalid_spreadsheet_url",
+                    "Invalid Google Sheets URL; provide a full docs.google.com/spreadsheets/d/... URL or spreadsheet ID.",
+                )
+            parts = parsed.path.split("/")
+            spreadsheet_id = parts[3] if len(parts) > 3 else ""
+        if not SPREADSHEET_ID_PATTERN.fullmatch(spreadsheet_id):
+            if parsed.scheme or parsed.netloc or "/" in name_or_id:
+                raise SheetsClientError(
+                    "invalid_spreadsheet_url",
+                    "Invalid Google Sheets URL; provide a full docs.google.com/spreadsheets/d/... URL or spreadsheet ID.",
+                )
+            raise SheetsClientError(
+                "title_resolution_requires_drive_scope",
+                "title_resolution_requires_drive_scope: broker mode requires a spreadsheet URL or ID.",
+            )
+        sheets_service = get_sheets_service()
+        metadata = sheets_service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="spreadsheetId,properties(title)",
+        ).execute()
+        return metadata.get("spreadsheetId", spreadsheet_id), metadata.get("properties", {}).get("title", "")
+
     drive_service = authenticate()
 
     if SPREADSHEET_ID_PATTERN.match(name_or_id):

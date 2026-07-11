@@ -1,6 +1,7 @@
 """Standalone MCP server for Google Sheets operations."""
 
 import json
+from functools import wraps
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,13 +18,52 @@ mcp = FastMCP(
 
 def _json_error(operation: str, error: Exception) -> str:
     """Return standardized JSON error payload for Sheets tools."""
-    return json.dumps(
-        {
-            "status": "error",
-            "error": str(error),
-            "operation": operation,
-        }
-    )
+    payload = {
+        "status": "error",
+        "error": str(error),
+        "operation": operation,
+    }
+    if isinstance(error, sheets_client.SheetsClientError):
+        payload["error_code"] = error.code
+        payload.update(error.details)
+    return json.dumps(payload)
+
+
+def _retry_once_on_google_401(tool):
+    """Re-fetch broker credentials and retry one complete tool call on Google 401."""
+    @wraps(tool)
+    def wrapped(*args, **kwargs):
+        try:
+            return tool(*args, **kwargs)
+        except sheets_client.HttpError as exc:
+            if (
+                not sheets_client.is_broker_mode()
+                or getattr(getattr(exc, "resp", None), "status", None) != 401
+            ):
+                raise
+            sheets_client.invalidate_broker_credentials()
+            try:
+                return tool(*args, **kwargs)
+            except sheets_client.HttpError as retry_exc:
+                if getattr(getattr(retry_exc, "resp", None), "status", None) != 401:
+                    raise
+                return _json_error(
+                    tool.__name__,
+                    sheets_client.SheetsClientError(
+                        "google_api_unauthorized",
+                        "Google Sheets authorization failed after one credential refresh.",
+                    ),
+                )
+    return wrapped
+
+
+def _reraise_broker_google_401(error: Exception) -> None:
+    if (
+        sheets_client.is_broker_mode()
+        and isinstance(error, sheets_client.HttpError)
+        and getattr(getattr(error, "resp", None), "status", None) == 401
+    ):
+        raise error
 
 
 def _validate_render_options(
@@ -43,13 +83,14 @@ def _validate_render_options(
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_list_tabs(spreadsheet: str) -> str:
-    """List tabs in a Google Sheets spreadsheet by name or spreadsheet ID.
+    """List tabs in a Google Sheets spreadsheet by URL or spreadsheet ID.
 
-    Discovery: run gsheet_search first when you only know a spreadsheet title
-    or partial name, then pass the returned spreadsheet_id or exact name here.
-    This is the safest first call before any range read/write because it returns
-    valid tab names.
+    In broker mode, pass a full Google Sheets URL or spreadsheet ID; titles
+    require Drive scope and are not accepted. Local dev mode also accepts exact
+    titles and can use gsheet_search. This is the safest first range-related call
+    because it returns valid tab names.
 
     Sibling tools: use gsheet_read_range once you know the tab and A1 range.
     Use gsheet_update_range, gsheet_append_rows, gsheet_clear_range, or
@@ -71,10 +112,12 @@ def gsheet_list_tabs(spreadsheet: str) -> str:
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_list_tabs", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_read_range(
     spreadsheet: str,
     cell_range: str,
@@ -83,10 +126,9 @@ def gsheet_read_range(
 ) -> str:
     """Read values from a range in a Google Sheets spreadsheet.
 
-    Discovery: run gsheet_search to resolve the spreadsheet and
-    gsheet_list_tabs to choose an existing tab before passing an A1-style
-    cell_range such as Sheet1!A1:D20. Use value_render_option and
-    date_time_render_option only with Google Sheets API-supported values.
+    Pass a spreadsheet URL or ID and use gsheet_list_tabs to choose an existing
+    tab before passing an A1-style range such as Sheet1!A1:D20. Local dev mode
+    additionally supports titles and gsheet_search.
 
     Sibling tools: use gsheet_update_range to overwrite a range,
     gsheet_append_rows to add rows, gsheet_clear_range to remove values, and
@@ -117,17 +159,18 @@ def gsheet_read_range(
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_read_range", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_update_range(spreadsheet: str, cell_range: str, values: list[list]) -> str:
     """Update a range in a Google Sheets spreadsheet using USER_ENTERED values.
 
-    Discovery: run gsheet_search and gsheet_list_tabs first to confirm the
-    spreadsheet and tab, then gsheet_read_range to inspect the current values
-    before overwriting. cell_range must be A1 notation and values must be a
-    two-dimensional row-major array.
+    Pass a spreadsheet URL or ID, confirm its tab with gsheet_list_tabs, then
+    inspect values before overwriting. Local dev mode additionally supports
+    titles and gsheet_search. Values must be a two-dimensional row-major array.
 
     Sibling tools: use gsheet_append_rows when adding new rows below an
     existing table, gsheet_clear_range when removing values, and
@@ -155,17 +198,18 @@ def gsheet_update_range(spreadsheet: str, cell_range: str, values: list[list]) -
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_update_range", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_append_rows(spreadsheet: str, cell_range: str, values: list[list]) -> str:
     """Append rows to a range in a Google Sheets spreadsheet.
 
-    Discovery: run gsheet_search and gsheet_list_tabs first, then
-    gsheet_read_range on the table header/body to confirm the destination
-    range. cell_range should point at the table or sheet area where Google
-    Sheets should append rows, and values must be a two-dimensional row array.
+    Pass a spreadsheet URL or ID, confirm its tab with gsheet_list_tabs, then
+    read the table header/body to confirm the destination. Local dev mode also
+    accepts titles and supports gsheet_search.
 
     Sibling tools: use gsheet_update_range for fixed-cell replacement and
     gsheet_clear_range for removing values. Use gsheet_list_tabs when an agent
@@ -193,15 +237,18 @@ def gsheet_append_rows(spreadsheet: str, cell_range: str, values: list[list]) ->
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_append_rows", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_create(title: str) -> str:
     """Create a new Google Sheets spreadsheet.
 
-    Discovery: run gsheet_search first if there may already be a spreadsheet
-    with the requested title. Use this only when a new file is required.
+    Use this only when a new file is required. In local dev mode, gsheet_search
+    can check whether a similarly titled spreadsheet already exists; broker
+    mode intentionally has no Drive-wide search.
 
     Sibling tools: after creation, use gsheet_update_range or
     gsheet_append_rows to populate values and gsheet_list_tabs to inspect the
@@ -221,10 +268,12 @@ def gsheet_create(title: str) -> str:
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_create", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_copy_spreadsheet(
     source: str,
     new_title: str,
@@ -232,10 +281,9 @@ def gsheet_copy_spreadsheet(
 ) -> str:
     """Copy all or selected tabs from one spreadsheet into a new spreadsheet.
 
-    Discovery: run gsheet_search first when you only know a spreadsheet title
-    or partial name, then pass the returned spreadsheet_id or exact name as
-    source. Use gsheet_list_tabs first when passing tabs so the names match
-    exactly.
+    In broker mode, pass the source as a Google Sheets URL or spreadsheet ID.
+    Local dev mode additionally accepts exact titles and supports gsheet_search.
+    Use gsheet_list_tabs first when passing tabs so names match exactly.
 
     Sibling tools: after copying, use gsheet_update_range to swap inputs,
     gsheet_touch_range to force custom-function recalculation, and
@@ -263,16 +311,18 @@ def gsheet_copy_spreadsheet(
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_copy_spreadsheet", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_search(query: str, max_results: int = 10) -> str:
     """Search Google Drive for spreadsheets by name.
 
-    Discovery: use this as the first step when the caller has a spreadsheet
-    title, partial title, or human description instead of a spreadsheet_id.
-    Results include candidate IDs and names for follow-up calls.
+    Local dev mode can use this when the caller has a title or partial title;
+    results include candidate IDs and names. Broker mode has spreadsheets scope
+    only and returns requires_drive_scope; use a spreadsheet URL or ID instead.
 
     Sibling tools: pass the chosen result to gsheet_list_tabs before range
     operations, or directly to gsheet_read_range when the tab/range is already
@@ -282,6 +332,11 @@ def gsheet_search(query: str, max_results: int = 10) -> str:
     cell contents inside spreadsheets.
     """
     try:
+        if sheets_client.is_broker_mode():
+            raise sheets_client.SheetsClientError(
+                "requires_drive_scope",
+                "requires_drive_scope: gsheet_search is unavailable in broker mode; use a spreadsheet URL or ID.",
+            )
         if max_results <= 0:
             raise ValueError("max_results must be > 0")
         drive_service = sheets_client.authenticate()
@@ -299,16 +354,18 @@ def gsheet_search(query: str, max_results: int = 10) -> str:
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_search", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_clear_range(spreadsheet: str, cell_range: str) -> str:
     """Clear all values in a range without deleting cells.
 
-    Discovery: run gsheet_search and gsheet_list_tabs to confirm the file and
-    tab, then gsheet_read_range to inspect the current values before clearing.
-    cell_range must be A1 notation such as Sheet1!A2:D20.
+    Pass a spreadsheet URL or ID, confirm the tab with gsheet_list_tabs, then
+    inspect values before clearing. Local dev mode additionally supports titles
+    and gsheet_search. cell_range must be A1 notation such as Sheet1!A2:D20.
 
     Sibling tools: use gsheet_update_range to replace values,
     gsheet_append_rows to add rows, and gsheet_touch_range when recalculation
@@ -334,17 +391,18 @@ def gsheet_clear_range(spreadsheet: str, cell_range: str) -> str:
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_clear_range", exc)
 
 
 @mcp.tool()
+@_retry_once_on_google_401
 def gsheet_touch_range(spreadsheet: str, cell_range: str) -> str:
     """Touch a range to force recalculation of custom functions.
 
-    Discovery: run gsheet_search and gsheet_list_tabs first, then
-    gsheet_read_range to confirm the formula range. cell_range must be A1
-    notation and should target formulas that can be safely cleared and
-    rewritten to trigger recalculation.
+    Pass a spreadsheet URL or ID, confirm its tab, then read the formula range.
+    Local dev mode additionally supports titles and gsheet_search. The A1 range
+    should target formulas that can be safely cleared and rewritten.
 
     Sibling tools: use gsheet_read_range for inspection, gsheet_update_range
     for intentional replacement, and gsheet_clear_range for value removal. This
@@ -370,6 +428,7 @@ def gsheet_touch_range(spreadsheet: str, cell_range: str) -> str:
             }
         )
     except Exception as exc:
+        _reraise_broker_google_401(exc)
         return _json_error("gsheet_touch_range", exc)
 
 
