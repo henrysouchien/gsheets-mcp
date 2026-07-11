@@ -4,12 +4,16 @@ import asyncio
 import io
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from urllib.error import HTTPError, URLError
 
+import google_auth_httplib2
+import httplib2
 import pytest
+from googleapiclient.discovery import build
 
 from src import server, sheets_client
 
@@ -76,9 +80,37 @@ def test_broker_refetches_near_expiry(monkeypatch):
         return _Response({"access_token": next(tokens), "expires_at": int(time.time()) + 30})
 
     monkeypatch.setattr(sheets_client.urllib_request, "urlopen", urlopen)
-    assert sheets_client._get_credentials().token == "first-token"
-    assert sheets_client._get_credentials().token == "second-token"
+    first = sheets_client._get_credentials()
+    assert first.token == "first-token"
+    second = sheets_client._get_credentials()
+    assert second.token == "second-token"
+    assert first is second
     assert calls == 2
+
+
+def test_broker_service_pins_one_request_refresh_attempt(monkeypatch):
+    underlying_http = MagicMock()
+    captured = {}
+    monkeypatch.setattr(sheets_client, "build_http", lambda: underlying_http)
+    monkeypatch.setattr(
+        sheets_client,
+        "_fetch_broker_token",
+        lambda: ("memory-only", int(time.time()) + 600),
+    )
+
+    def fake_build(api, version, **kwargs):
+        captured.update(api=api, version=version, **kwargs)
+        return object()
+
+    monkeypatch.setattr(sheets_client, "build", fake_build)
+    sheets_client.get_sheets_service()
+
+    assert captured["api"] == "sheets"
+    assert captured["version"] == "v4"
+    assert "credentials" not in captured
+    assert isinstance(captured["http"], google_auth_httplib2.AuthorizedHttp)
+    assert captured["http"].http is underlying_http
+    assert captured["http"]._max_refresh_attempts == 1
 
 
 @pytest.mark.parametrize(
@@ -129,36 +161,133 @@ def test_broker_connection_error_is_typed_unavailable(monkeypatch):
     assert "offline" not in str(exc_info.value)
 
 
-def test_google_401_refetches_once_per_tool_call(monkeypatch):
-    broker_calls = 0
-    api_calls = 0
+class _InjectingHttp:
+    def __init__(self, responder):
+        self.responder = responder
+        self.requests = []
 
-    def urlopen(*args, **kwargs):
-        nonlocal broker_calls
-        broker_calls += 1
-        return _Response({"access_token": f"token-{broker_calls}", "expires_at": int(time.time()) + 600})
+    def request(self, uri, method="GET", body=None, headers=None, **kwargs):
+        self.requests.append((method, uri, body))
+        status, payload = self.responder(method, uri, body)
+        response = httplib2.Response(
+            {"status": str(status), "reason": "Unauthorized" if status == 401 else "OK"}
+        )
+        response.reason = "Unauthorized" if status == 401 else "OK"
+        return response, json.dumps(payload).encode()
 
-    def build_service():
-        nonlocal api_calls
-        sheets_client._get_credentials()
-        service = MagicMock()
 
-        def execute():
-            nonlocal api_calls
-            api_calls += 1
-            if api_calls == 1:
-                raise sheets_client.HttpError(SimpleNamespace(status=401, reason="Unauthorized"), b"")
-            return {"spreadsheetId": "new-sheet", "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/new-sheet"}
+def _real_service(http):
+    creds = sheets_client.BrokerCredentials()
+    creds.token = "initial-token"
+    creds.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)
+    authed_http = google_auth_httplib2.AuthorizedHttp(
+        creds, http=http, max_refresh_attempts=1
+    )
+    return build("sheets", "v4", http=authed_http, static_discovery=True)
 
-        service.spreadsheets.return_value.create.return_value.execute.side_effect = execute
-        return service
 
-    monkeypatch.setattr(sheets_client.urllib_request, "urlopen", urlopen)
-    monkeypatch.setattr(sheets_client, "get_sheets_service", build_service)
-    payload = json.loads(server.gsheet_create("New Sheet"))
+def _install_broker_refresh(monkeypatch, *, error=None):
+    calls = []
+
+    def fetch():
+        calls.append(1)
+        if error is not None:
+            raise error
+        return "refreshed-token", int(time.time()) + 600
+
+    monkeypatch.setattr(sheets_client, "_fetch_broker_token", fetch)
+    return calls
+
+
+def test_copy_401_retries_only_copy_request(monkeypatch):
+    copy_attempts = 0
+
+    def respond(method, uri, body):
+        nonlocal copy_attempts
+        if method == "GET":
+            if "namedRanges" in uri:
+                return 200, {"properties": {}}
+            return 200, {"sheets": [{"properties": {"sheetId": 101, "title": "Data", "index": 0}}]}
+        if method == "POST" and "/v4/spreadsheets?" in uri:
+            return 200, {"spreadsheetId": "destination", "spreadsheetUrl": "url", "sheets": [{"properties": {"sheetId": 900, "title": "Sheet1"}}]}
+        if ":copyTo" in uri:
+            copy_attempts += 1
+            return (401, {}) if copy_attempts == 1 else (200, {"sheetId": 201})
+        if ":batchUpdate" in uri:
+            return 200, {}
+        raise AssertionError((method, uri, body))
+
+    http = _InjectingHttp(respond)
+    service = _real_service(http)
+    refreshes = _install_broker_refresh(monkeypatch)
+    monkeypatch.setattr(sheets_client, "resolve_spreadsheet_id", lambda source: ("source", "Source"))
+    monkeypatch.setattr(sheets_client, "get_sheets_service", lambda: service)
+
+    payload = json.loads(server.gsheet_copy_spreadsheet("source", "Copy"))
+    assert payload["status"] == "ok", payload
+    assert sum(method == "POST" and "/v4/spreadsheets?" in uri for method, uri, _ in http.requests) == 1
+    assert copy_attempts == 2
+    assert len(refreshes) == 1
+
+
+def test_touch_401_retries_only_update_request(monkeypatch):
+    update_attempts = 0
+    formulas = [["=CUSTOM()"]]
+
+    def respond(method, uri, body):
+        nonlocal update_attempts
+        if method == "GET" and "/values/" in uri:
+            return 200, {"values": formulas}
+        if method == "POST" and uri.endswith(":clear?alt=json"):
+            return 200, {"clearedRange": "Sheet1!A1"}
+        if method == "PUT" and "/values/" in uri:
+            update_attempts += 1
+            return (401, {}) if update_attempts == 1 else (200, {"updatedRange": "Sheet1!A1", "updatedCells": 1})
+        raise AssertionError((method, uri, body))
+
+    http = _InjectingHttp(respond)
+    service = _real_service(http)
+    refreshes = _install_broker_refresh(monkeypatch)
+    monkeypatch.setattr(sheets_client, "resolve_spreadsheet_id", lambda source: ("sheet", "Sheet"))
+    monkeypatch.setattr(sheets_client, "get_sheets_service", lambda: service)
+
+    payload = json.loads(server.gsheet_touch_range("sheet", "Sheet1!A1"))
     assert payload["status"] == "ok"
-    assert broker_calls == 2
-    assert api_calls == 2
+    assert payload["touchedCells"] == 1
+    assert sum(method == "GET" for method, _, _ in http.requests) == 1
+    assert sum(uri.endswith(":clear?alt=json") for _, uri, _ in http.requests) == 1
+    assert update_attempts == 2
+    assert len(refreshes) == 1
+
+
+def test_second_google_401_is_typed_and_does_not_loop(monkeypatch):
+    http = _InjectingHttp(lambda method, uri, body: (401, {}))
+    service = _real_service(http)
+    refreshes = _install_broker_refresh(monkeypatch)
+    monkeypatch.setattr(sheets_client, "get_sheets_service", lambda: service)
+
+    payload = json.loads(server.gsheet_create("New Sheet"))
+    assert payload["error_code"] == "google_api_unauthorized"
+    assert len(refreshes) == 1
+    assert len(http.requests) == 2
+
+
+def test_mid_tool_broker_rate_limit_is_typed_and_terminal(monkeypatch):
+    http = _InjectingHttp(lambda method, uri, body: (401, {}))
+    service = _real_service(http)
+    refreshes = _install_broker_refresh(
+        monkeypatch,
+        error=sheets_client.SheetsClientError(
+            "broker_rate_limited", "rate limited", retry_after_s=17
+        ),
+    )
+    monkeypatch.setattr(sheets_client, "get_sheets_service", lambda: service)
+
+    payload = json.loads(server.gsheet_create("New Sheet"))
+    assert payload["error_code"] == "broker_rate_limited"
+    assert payload["retry_after_s"] == 17
+    assert len(refreshes) == 1
+    assert len(http.requests) == 1
 
 
 def test_broker_full_tool_call_writes_no_token_file(monkeypatch, tmp_path):
@@ -199,6 +328,9 @@ def test_broker_headless_consent_path_hard_fails(monkeypatch, tmp_path):
     [
         ("abc1234567890XYZ___123", "abc1234567890XYZ___123"),
         ("https://docs.google.com/spreadsheets/d/abc1234567890XYZ___123/edit#gid=0", "abc1234567890XYZ___123"),
+        ("https://DOCS.GOOGLE.COM/spreadsheets/d/abc1234567890XYZ___123/edit", "abc1234567890XYZ___123"),
+        ("https://docs.google.com/spreadsheets/u/0/d/abc1234567890XYZ___123/edit#gid=0", "abc1234567890XYZ___123"),
+        ("https://docs.google.com/spreadsheets/u/12/d/abc1234567890XYZ___123/edit?usp=sharing", "abc1234567890XYZ___123"),
     ],
 )
 def test_broker_resolve_id_or_url_validates_with_sheets(monkeypatch, address, expected):
@@ -223,6 +355,20 @@ def test_broker_resolve_title_and_malformed_url_are_typed():
     with pytest.raises(sheets_client.SheetsClientError) as url_error:
         sheets_client.resolve_spreadsheet_id("https://example.com/spreadsheets/d/not-google")
     assert url_error.value.code == "invalid_spreadsheet_url"
+
+    for address in (
+        "https://docs.google.com@evil.com/spreadsheets/d/abc1234567890XYZ___123",
+        "https://docs.google.com:8443/spreadsheets/d/abc1234567890XYZ___123",
+    ):
+        with pytest.raises(sheets_client.SheetsClientError) as unsafe_url_error:
+            sheets_client.resolve_spreadsheet_id(address)
+        assert unsafe_url_error.value.code == "invalid_spreadsheet_url"
+
+    with pytest.raises(sheets_client.SheetsClientError) as qualifier_error:
+        sheets_client.resolve_spreadsheet_id(
+            "https://docs.google.com/spreadsheets/u/x/d/abc1234567890XYZ___123/edit"
+        )
+    assert qualifier_error.value.code == "invalid_spreadsheet_url"
 
 
 def test_gsheet_search_broker_mode_requires_drive_scope():

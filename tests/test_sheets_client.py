@@ -264,10 +264,10 @@ def test_copy_spreadsheet_copies_all_tabs_and_renames_in_order() -> None:
         new_title="[hank] HCM Comps",
     )
 
-    assert call_order == ["get", "create", "copyTo:101", "copyTo:102", "batchUpdate"]
+    assert call_order == ["get", "get", "create", "copyTo:101", "copyTo:102", "batchUpdate"]
     spreadsheets_api.create.assert_called_once_with(
         body={"properties": {"title": "[hank] HCM Comps"}},
-        fields="spreadsheetId,spreadsheetUrl,sheets(properties(sheetId,title,index))",
+        fields="spreadsheetId,spreadsheetUrl,properties(locale,timeZone),sheets(properties(sheetId,title,index))",
     )
     spreadsheets_api.batchUpdate.assert_called_once_with(
         spreadsheetId="new-sheet",
@@ -302,6 +302,7 @@ def test_copy_spreadsheet_copies_all_tabs_and_renames_in_order() -> None:
         "title": "[hank] HCM Comps",
         "url": "https://docs.google.com/spreadsheets/d/new-sheet",
         "copied_tabs": ["Comps", "Assumptions"],
+        "warnings": [],
     }
 
 
@@ -449,3 +450,72 @@ def test_touch_sheet_range_empty_range_returns_without_writes() -> None:
     values_api.clear.assert_not_called()
     values_api.update.assert_not_called()
     assert result == {"touchedRange": "Sheet1!A1:B2", "touchedCells": 0}
+
+
+def _copy_service(named_ranges, source_props, copy_props):
+    service = MagicMock()
+    spreadsheets = service.spreadsheets.return_value
+
+    def fake_get(*, spreadsheetId, fields):
+        request = MagicMock()
+        if fields.startswith("sheets("):
+            request.execute.return_value = {
+                "sheets": [
+                    {
+                        "properties": {
+                            "sheetId": 11,
+                            "title": "Tab1",
+                            "index": 0,
+                            "gridProperties": {"rowCount": 10, "columnCount": 5},
+                        }
+                    }
+                ]
+            }
+        else:
+            request.execute.return_value = {
+                "properties": source_props,
+                "namedRanges": [{"name": name} for name in named_ranges],
+            }
+        return request
+
+    spreadsheets.get.side_effect = fake_get
+    spreadsheets.create.return_value.execute.return_value = {
+        "spreadsheetId": "new1234567890XYZ___12",
+        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/new1234567890XYZ___12",
+        "properties": copy_props,
+        "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}}],
+    }
+    spreadsheets.sheets.return_value.copyTo.return_value.execute.return_value = {
+        "sheetId": 77
+    }
+    spreadsheets.batchUpdate.return_value.execute.return_value = {}
+    return service
+
+
+def test_copy_spreadsheet_warns_on_named_ranges_and_locale_mismatch() -> None:
+    service = _copy_service(
+        named_ranges=["RosterRange", "AnchorCells"],
+        source_props={"locale": "en_US", "timeZone": "America/New_York"},
+        copy_props={"locale": "en_GB", "timeZone": "Etc/GMT"},
+    )
+
+    result = sheets_client.copy_spreadsheet(service, "src1234567890XYZ___12", "copy")
+
+    assert len(result["warnings"]) == 3
+    assert "2 spreadsheet-level named range(s) NOT copied" in result["warnings"][0]
+    assert "AnchorCells, RosterRange" in result["warnings"][0]
+    assert "locale" in result["warnings"][1]
+    assert "time zone" in result["warnings"][2]
+
+
+def test_copy_spreadsheet_no_warnings_without_spreadsheet_level_gaps() -> None:
+    service = _copy_service(
+        named_ranges=[],
+        source_props={"locale": "en_US", "timeZone": "America/New_York"},
+        copy_props={"locale": "en_US", "timeZone": "America/New_York"},
+    )
+
+    result = sheets_client.copy_spreadsheet(service, "src1234567890XYZ___12", "copy")
+
+    assert result["warnings"] == []
+    assert result["copied_tabs"] == ["Tab1"]

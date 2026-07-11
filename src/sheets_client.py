@@ -6,16 +6,20 @@ import os
 import pickle
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urljoin, urlparse
 
+import google_auth_httplib2
+from google.auth.credentials import Credentials as GoogleAuthCredentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import build_http
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
@@ -24,6 +28,9 @@ SCOPES = [
 
 GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 SPREADSHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+# Real Sheets URLs may carry an account-qualifier segment (/u/<n>/) between
+# /spreadsheets/ and /d/ when the browser session has multiple Google accounts.
+SPREADSHEET_URL_PATH_PATTERN = re.compile(r"^/spreadsheets/(?:u/\d+/)?d/([A-Za-z0-9_-]+)")
 BROKER_REFRESH_MARGIN_SECONDS = 60
 
 VALID_VALUE_RENDER_OPTIONS = {
@@ -92,7 +99,7 @@ def _broker_error(code: str, payload: dict | None = None) -> SheetsClientError:
     )
 
 
-def _fetch_broker_credentials() -> tuple[Credentials, int]:
+def _fetch_broker_token() -> tuple[str, int]:
     base_url = os.environ.get("GSHEETS_BROKER_URL", "").strip()
     session_token = os.environ.get("GSHEETS_BROKER_SESSION_TOKEN", "").strip()
     if not base_url or not session_token:
@@ -126,7 +133,24 @@ def _fetch_broker_credentials() -> tuple[Credentials, int]:
     expires_at = payload.get("expires_at") if isinstance(payload, dict) else None
     if not isinstance(token, str) or not token or isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
         raise _broker_error("sheets_unavailable")
-    return Credentials(token=token), int(expires_at)
+    return token, int(expires_at)
+
+
+class BrokerCredentials(GoogleAuthCredentials):
+    """In-memory credentials refreshed exclusively through the token broker."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.expiry = None
+
+    def refresh(self, request) -> None:
+        del request  # The broker uses its own bounded HTTP request.
+        global _cached_broker_expires_at
+        token, expires_at = _fetch_broker_token()
+        self.token = token
+        # google-auth compares expiry with a naive UTC datetime.
+        self.expiry = datetime.fromtimestamp(expires_at, tz=timezone.utc).replace(tzinfo=None)
+        _cached_broker_expires_at = expires_at
 
 
 def _get_missing_scopes(creds) -> list[str]:
@@ -160,11 +184,10 @@ def _get_credentials():
     global _cached_creds, _cached_broker_expires_at
 
     if is_broker_mode():
-        if (
-            _cached_creds is None
-            or _cached_broker_expires_at - int(time.time()) <= BROKER_REFRESH_MARGIN_SECONDS
-        ):
-            _cached_creds, _cached_broker_expires_at = _fetch_broker_credentials()
+        if _cached_creds is None:
+            _cached_creds = BrokerCredentials()
+        if _cached_broker_expires_at - int(time.time()) <= BROKER_REFRESH_MARGIN_SECONDS:
+            _cached_creds.refresh(None)
         return _cached_creds
 
     creds = _cached_creds
@@ -205,6 +228,13 @@ def authenticate():
 def get_sheets_service():
     """Authenticate with Google Sheets API and return a service object."""
     creds = _get_credentials()
+    if is_broker_mode():
+        authed_http = google_auth_httplib2.AuthorizedHttp(
+            creds,
+            http=build_http(),
+            max_refresh_attempts=1,
+        )
+        return build("sheets", "v4", http=authed_http)
     return build("sheets", "v4", credentials=creds)
 
 
@@ -214,17 +244,20 @@ def resolve_spreadsheet_id(name_or_id: str) -> tuple[str, str]:
         spreadsheet_id = name_or_id
         parsed = urlparse(name_or_id)
         if parsed.scheme or parsed.netloc:
+            path_match = SPREADSHEET_URL_PATH_PATTERN.match(parsed.path)
             if (
                 parsed.scheme != "https"
-                or parsed.netloc != "docs.google.com"
-                or not parsed.path.startswith("/spreadsheets/d/")
+                or parsed.hostname != "docs.google.com"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.port is not None
+                or path_match is None
             ):
                 raise SheetsClientError(
                     "invalid_spreadsheet_url",
                     "Invalid Google Sheets URL; provide a full docs.google.com/spreadsheets/d/... URL or spreadsheet ID.",
                 )
-            parts = parsed.path.split("/")
-            spreadsheet_id = parts[3] if len(parts) > 3 else ""
+            spreadsheet_id = path_match.group(1)
         if not SPREADSHEET_ID_PATTERN.fullmatch(spreadsheet_id):
             if parsed.scheme or parsed.netloc or "/" in name_or_id:
                 raise SheetsClientError(
@@ -474,6 +507,13 @@ def copy_spreadsheet(
     if not source_tabs:
         raise ValueError("Source spreadsheet has no tabs")
 
+    # Tab-level copyTo cannot carry spreadsheet-level objects; the per-user
+    # OAuth spec (§5) requires surfacing that gap instead of degrading silently.
+    source_meta = sheets_service.spreadsheets().get(
+        spreadsheetId=source_spreadsheet_id,
+        fields="properties(locale,timeZone),namedRanges(name)",
+    ).execute()
+
     if requested_tabs is None:
         selected_tabs = source_tabs
     else:
@@ -485,7 +525,7 @@ def copy_spreadsheet(
 
     create_result = sheets_service.spreadsheets().create(
         body={"properties": {"title": new_title}},
-        fields="spreadsheetId,spreadsheetUrl,sheets(properties(sheetId,title,index))",
+        fields="spreadsheetId,spreadsheetUrl,properties(locale,timeZone),sheets(properties(sheetId,title,index))",
     ).execute()
     new_spreadsheet_id = create_result.get("spreadsheetId", "")
     spreadsheet_url = create_result.get("spreadsheetUrl", "")
@@ -540,11 +580,33 @@ def copy_spreadsheet(
         body={"requests": batch_requests},
     ).execute()
 
+    warnings = []
+    named_ranges = sorted(
+        named_range.get("name", "")
+        for named_range in source_meta.get("namedRanges", [])
+    )
+    if named_ranges:
+        warnings.append(
+            f"{len(named_ranges)} spreadsheet-level named range(s) NOT copied "
+            f"(tab-level copy cannot carry them): {', '.join(named_ranges)}"
+        )
+    source_props = source_meta.get("properties", {})
+    copy_props = create_result.get("properties", {})
+    for prop_key, label in (("locale", "locale"), ("timeZone", "time zone")):
+        source_value = source_props.get(prop_key)
+        copy_value = copy_props.get(prop_key)
+        if source_value and copy_value and source_value != copy_value:
+            warnings.append(
+                f"copy {label} is {copy_value!r} but source is {source_value!r}; "
+                "spreadsheet-level settings are not carried by tab-level copy"
+            )
+
     return {
         "spreadsheet_id": new_spreadsheet_id,
         "title": new_title,
         "url": spreadsheet_url,
         "copied_tabs": [copied_tab["source_title"] for copied_tab in copied_tabs],
+        "warnings": warnings,
     }
 
 

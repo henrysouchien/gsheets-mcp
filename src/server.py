@@ -1,7 +1,6 @@
 """Standalone MCP server for Google Sheets operations."""
 
 import json
-from functools import wraps
 
 from mcp.server.fastmcp import FastMCP
 
@@ -26,44 +25,14 @@ def _json_error(operation: str, error: Exception) -> str:
     if isinstance(error, sheets_client.SheetsClientError):
         payload["error_code"] = error.code
         payload.update(error.details)
-    return json.dumps(payload)
-
-
-def _retry_once_on_google_401(tool):
-    """Re-fetch broker credentials and retry one complete tool call on Google 401."""
-    @wraps(tool)
-    def wrapped(*args, **kwargs):
-        try:
-            return tool(*args, **kwargs)
-        except sheets_client.HttpError as exc:
-            if (
-                not sheets_client.is_broker_mode()
-                or getattr(getattr(exc, "resp", None), "status", None) != 401
-            ):
-                raise
-            sheets_client.invalidate_broker_credentials()
-            try:
-                return tool(*args, **kwargs)
-            except sheets_client.HttpError as retry_exc:
-                if getattr(getattr(retry_exc, "resp", None), "status", None) != 401:
-                    raise
-                return _json_error(
-                    tool.__name__,
-                    sheets_client.SheetsClientError(
-                        "google_api_unauthorized",
-                        "Google Sheets authorization failed after one credential refresh.",
-                    ),
-                )
-    return wrapped
-
-
-def _reraise_broker_google_401(error: Exception) -> None:
-    if (
+    elif (
         sheets_client.is_broker_mode()
         and isinstance(error, sheets_client.HttpError)
         and getattr(getattr(error, "resp", None), "status", None) == 401
     ):
-        raise error
+        payload["error"] = "Google Sheets authorization failed after one credential refresh."
+        payload["error_code"] = "google_api_unauthorized"
+    return json.dumps(payload)
 
 
 def _validate_render_options(
@@ -83,7 +52,6 @@ def _validate_render_options(
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_list_tabs(spreadsheet: str) -> str:
     """List tabs in a Google Sheets spreadsheet by URL or spreadsheet ID.
 
@@ -112,12 +80,10 @@ def gsheet_list_tabs(spreadsheet: str) -> str:
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_list_tabs", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_read_range(
     spreadsheet: str,
     cell_range: str,
@@ -159,12 +125,10 @@ def gsheet_read_range(
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_read_range", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_update_range(spreadsheet: str, cell_range: str, values: list[list]) -> str:
     """Update a range in a Google Sheets spreadsheet using USER_ENTERED values.
 
@@ -198,12 +162,10 @@ def gsheet_update_range(spreadsheet: str, cell_range: str, values: list[list]) -
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_update_range", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_append_rows(spreadsheet: str, cell_range: str, values: list[list]) -> str:
     """Append rows to a range in a Google Sheets spreadsheet.
 
@@ -237,12 +199,10 @@ def gsheet_append_rows(spreadsheet: str, cell_range: str, values: list[list]) ->
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_append_rows", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_create(title: str) -> str:
     """Create a new Google Sheets spreadsheet.
 
@@ -268,12 +228,10 @@ def gsheet_create(title: str) -> str:
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_create", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_copy_spreadsheet(
     source: str,
     new_title: str,
@@ -288,6 +246,10 @@ def gsheet_copy_spreadsheet(
     Sibling tools: after copying, use gsheet_update_range to swap inputs,
     gsheet_touch_range to force custom-function recalculation, and
     gsheet_read_range to inspect copied values or formulas.
+
+    Output includes a warnings list when spreadsheet-level objects the
+    tab-level copy cannot carry (named ranges, locale/time zone) would be
+    lost; an empty list means no such gap was detected.
 
     Common mistake: this creates a new spreadsheet file. It does not duplicate
     a tab inside the source spreadsheet, and tabs must be tab names, not ranges.
@@ -308,15 +270,14 @@ def gsheet_copy_spreadsheet(
                 "title": copy_result.get("title", new_title),
                 "url": copy_result.get("url", ""),
                 "copied_tabs": copy_result.get("copied_tabs", []),
+                "warnings": copy_result.get("warnings", []),
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_copy_spreadsheet", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_search(query: str, max_results: int = 10) -> str:
     """Search Google Drive for spreadsheets by name.
 
@@ -354,12 +315,10 @@ def gsheet_search(query: str, max_results: int = 10) -> str:
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_search", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_clear_range(spreadsheet: str, cell_range: str) -> str:
     """Clear all values in a range without deleting cells.
 
@@ -391,12 +350,10 @@ def gsheet_clear_range(spreadsheet: str, cell_range: str) -> str:
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_clear_range", exc)
 
 
 @mcp.tool()
-@_retry_once_on_google_401
 def gsheet_touch_range(spreadsheet: str, cell_range: str) -> str:
     """Touch a range to force recalculation of custom functions.
 
@@ -428,7 +385,6 @@ def gsheet_touch_range(spreadsheet: str, cell_range: str) -> str:
             }
         )
     except Exception as exc:
-        _reraise_broker_google_401(exc)
         return _json_error("gsheet_touch_range", exc)
 
 
