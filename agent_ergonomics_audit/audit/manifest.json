@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.1.0",
+  "tool_name": "gsheets-mcp",
+  "tool_repo": "/Users/henrychien/Documents/Jupyter/gsheets-mcp",
+  "audit_workspace": "/Users/henrychien/Documents/Jupyter/gsheets-mcp/agent_ergonomics_audit",
+  "rubric_version": "sha256:44e7c00b3dee6be38118f1f40719d814278cb129f9aad34572e0936104b135a4",
+  "passes": [
+    {
+      "pass": 1,
+      "started_at": "2026-07-14T14:50:32Z",
+      "completed_at": "2026-07-14T16:18:51Z",
+      "mode": "full",
+      "baseline_sha": "b72d8a3420fb417d7842b83ce87dd4961d74d10f",
+      "target_sha": "ea10997e540d28a5562cb346b9607ea0791376eb",
+      "target_branch": "main",
+      "feature_branch": null,
+      "cutover_commits": [
+        {
+          "repository": "gsheets-mcp",
+          "commit_sha": "ea10997e540d28a5562cb346b9607ea0791376eb"
+        },
+        {
+          "repository": "AI-excel-addin",
+          "commit_sha": "e9499747ae281ffff71c0ad76c1f002ce7de49bd"
+        },
+        {
+          "repository": "risk_module",
+          "commit_sha": "a0588b7979acae5b78897f4089d7c497021b8a6b"
+        }
+      ],
+      "summary": {
+        "surfaces_inventoried": 23,
+        "surfaces_scored": 23,
+        "recommendations_total": 8,
+        "recommendations_applied": 8,
+        "substantive_commits": 3,
+        "substantive_landed_changes": 8,
+        "dimensions_touched": 11,
+        "ambition_bar_met": true,
+        "ambition_bar_self_prompt_run": true,
+        "median_uplift_pts": 445,
+        "regressions_count": 0,
+        "fresh_eyes_rounds": 2,
+        "simulator_tasks_passed": 7,
+        "simulator_tasks_total": 7,
+        "simulator_median_round_trips": 1
+      },
+      "artifacts": {
+        "surface_inventory": "audit/surface_inventory.jsonl",
+        "agent_surfaces": "audit/agent_surfaces.jsonl",
+        "agent_surfaces_baseline": "audit/agent_surfaces_pass_1.jsonl",
+        "intent_corpus": "audit/intent_inference_corpus.jsonl",
+        "intent_results_post": "audit/phase3_intent_results_pass_2.md",
+        "recommendations": "audit/recommendations.jsonl",
+        "playbook": "audit/playbook.md",
+        "applied_changes": "audit/applied_changes.jsonl",
+        "ambition_bar_check": "audit/ambition_bar_check.md",
+        "scorecard": "audit/scorecard.md",
+        "scorecard_baseline": "audit/scorecard_pass_1.md",
+        "scorecard_post": "audit/scorecard_pass_2.md",
+        "heatmap": "audit/heatmap.svg",
+        "uplift_diff": "audit/uplift_diff.md",
+        "regression_alerts": "audit/regression_alerts.md",
+        "fresh_eyes": "audit/phase7_fresh_eyes.md",
+        "canonical_tasks": "audit/canonical_tasks.md",
+        "handoff": "audit/HANDOFF.md",
+        "simulations_pre": "audit/agent_simulations/pre_pass_1/",
+        "simulations_pre_status": "not_run_before_cutover",
+        "simulations_post": "audit/agent_simulations/post_pass_2/"
+      }
+    }
+  ],
+  "current_pass": 1,
+  "pass_N+1_ready": true,
+  "next_pass_focus": "Authorized maintenance window: deploy the three pinned commits as one cutover, refresh gateway schemas, and run live OAuth/broker smoke tests."
+}
