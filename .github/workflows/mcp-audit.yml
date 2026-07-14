@@ -3,26 +3,18 @@ name: MCP audit
 on:
   pull_request:
     paths:
-      - "**/mcp_server.py"
-      - "**/x_mcp_server.py"
-      - "**/*_mcp_server.py"
-      - "**/mcp_servers/**/*.py"
-      - "**/mcp-server/**/*.py"
-      - "**/src/server.py"
-      - "**/server.py"
+      - "src/gsheets_mcp/**"
+      - "tests/**"
+      - "pyproject.toml"
       - "scripts/mcp_lint.py"
       - ".pre-commit-config.yaml"
       - ".github/workflows/mcp-audit.yml"
   push:
     branches: [main]
     paths:
-      - "**/mcp_server.py"
-      - "**/x_mcp_server.py"
-      - "**/*_mcp_server.py"
-      - "**/mcp_servers/**/*.py"
-      - "**/mcp-server/**/*.py"
-      - "**/src/server.py"
-      - "**/server.py"
+      - "src/gsheets_mcp/**"
+      - "tests/**"
+      - "pyproject.toml"
       - "scripts/mcp_lint.py"
       - ".pre-commit-config.yaml"
       - ".github/workflows/mcp-audit.yml"
@@ -39,5 +31,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run MCP ergonomics lint
-        run: python3 scripts/mcp_lint.py --all
+      - name: Install package
+        run: python3 -m pip install -e ".[dev]"
+
+      - name: Run MCP live-contract lint
+        run: python3 scripts/mcp_lint.py
+
+      - name: Run tests
+        run: python3 -m pytest -q

@@ -2,8 +2,16 @@ repos:
   - repo: local
     hooks:
       - id: mcp-tool-lint
-        name: MCP tool ergonomics lint
+        name: MCP live contract lint
         entry: python3 scripts/mcp_lint.py --staged
         language: system
-        files: '(^|/)mcp_server\.py$|(^|/)x_mcp_server\.py$|(^|/)[A-Za-z0-9_]+_mcp_server\.py$|(^|/)mcp_servers/.*\.py$|(^|/)mcp-server/.*\.py$|(^|/)src/server\.py$|(^|/)server\.py$'
-        require_serial: false
+        files: '^(src/gsheets_mcp/|tests/|scripts/mcp_lint\.py$|pyproject\.toml$|\.pre-commit-config\.yaml$|\.github/workflows/mcp-audit\.yml$)'
+        pass_filenames: false
+        require_serial: true
+      - id: gsheets-mcp-tests
+        name: gsheets-mcp tests
+        entry: venv/bin/python -m pytest -q
+        language: system
+        files: '^(src/gsheets_mcp/|tests/|scripts/mcp_lint\.py$|pyproject\.toml$)'
+        pass_filenames: false
+        require_serial: true

@@ -1,520 +1,565 @@
-"""Unit tests for gsheets-mcp Sheets client helpers."""
+"""Offline unit tests for strict references and mutation recovery semantics."""
 
-import importlib
-import sys
-from pathlib import Path
+from __future__ import annotations
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from src import sheets_client
+from gsheets_mcp import sheets_client
 
 
-def test_google_sheet_credential_paths_can_be_overridden_by_env(
-    monkeypatch: pytest.MonkeyPatch,
+SPREADSHEET_ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        SPREADSHEET_ID,
+        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid=0",
+        f"https://DOCS.GOOGLE.COM/spreadsheets/d/{SPREADSHEET_ID}/view",
+        f"https://docs.google.com/spreadsheets/u/0/d/{SPREADSHEET_ID}/edit?usp=sharing",
+        f"https://docs.google.com/spreadsheets/u/12/d/{SPREADSHEET_ID}/copy",
+    ],
+)
+def test_parse_spreadsheet_reference_accepts_only_id_or_strict_url(
+    reference: str,
 ) -> None:
-    monkeypatch.setenv("GOOGLE_CREDENTIALS_FILE", "/tmp/gsheets-credentials.json")
-    monkeypatch.setenv("GOOGLE_TOKEN_FILE", "/tmp/gsheets-token.pickle")
-    reloaded = importlib.reload(sheets_client)
-
-    try:
-        assert reloaded.CREDENTIALS_FILE == Path("/tmp/gsheets-credentials.json")
-        assert reloaded.TOKEN_FILE == Path("/tmp/gsheets-token.pickle")
-    finally:
-        monkeypatch.delenv("GOOGLE_CREDENTIALS_FILE", raising=False)
-        monkeypatch.delenv("GOOGLE_TOKEN_FILE", raising=False)
-        importlib.reload(sheets_client)
+    assert sheets_client.parse_spreadsheet_reference(reference) == SPREADSHEET_ID
 
 
-def _http_404_error() -> Exception:
-    return sheets_client.HttpError(
-        SimpleNamespace(status=404, reason="Not Found"),
-        b"Not Found",
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "Quarterly Comps",
+        "short-id",
+        "https://example.com/spreadsheets/d/not-google",
+        f"https://docs.google.com@evil.example/spreadsheets/d/{SPREADSHEET_ID}",
+        f"https://docs.google.com:8443/spreadsheets/d/{SPREADSHEET_ID}",
+        f"https://docs.google.com:bad/spreadsheets/d/{SPREADSHEET_ID}",
+        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/../d/other7890123456789012",
+        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export",
+        f"https://docs.google.com/spreadsheets/u/x/d/{SPREADSHEET_ID}/edit",
+    ],
+)
+def test_parse_spreadsheet_reference_rejects_titles_and_unsafe_urls(
+    reference: str,
+) -> None:
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.parse_spreadsheet_reference(reference)
+
+    assert exc_info.value.code == "invalid_spreadsheet_reference"
+    assert exc_info.value.details["outcome_state"] == "not_started"
+    assert exc_info.value.details["retry_action"] == "correct_arguments"
+
+
+def test_resolve_spreadsheet_verifies_normalized_id_with_sheets_only() -> None:
+    service = MagicMock()
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "spreadsheetId": SPREADSHEET_ID,
+        "properties": {"title": "Validated"},
+    }
+
+    assert sheets_client.resolve_spreadsheet(
+        service,
+        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit",
+    ) == (SPREADSHEET_ID, "Validated")
+    service.spreadsheets.return_value.get.assert_called_once_with(
+        spreadsheetId=SPREADSHEET_ID,
+        fields="spreadsheetId,properties(title)",
     )
 
 
-def _files_list_call_args(service_mock) -> dict:
-    return service_mock.files.return_value.list.call_args.kwargs
+def test_read_range_rejects_unknown_render_options_before_api_call() -> None:
+    service = MagicMock()
 
-
-def test_value_render_option_validation() -> None:
-    sheets_service = MagicMock()
-
-    with pytest.raises(ValueError) as exc_info:
+    with pytest.raises(ValueError, match="Invalid value_render_option"):
         sheets_client.read_sheet_range(
-            sheets_service,
-            spreadsheet_id="sheet-123",
-            range_a1="Sheet1!A1:A2",
-            value_render_option="BAD_VALUE",
+            service,
+            SPREADSHEET_ID,
+            "Comps!A1:B2",
+            value_render_option="RAW",
+        )
+    with pytest.raises(ValueError, match="Invalid date_time_render_option"):
+        sheets_client.read_sheet_range(
+            service,
+            SPREADSHEET_ID,
+            "Comps!A1:B2",
+            date_time_render_option="ISO8601",
         )
 
-    msg = str(exc_info.value)
-    assert "Invalid value_render_option 'BAD_VALUE'" in msg
-    assert "FORMULA" in msg
-    assert "FORMATTED_VALUE" in msg
-    assert "UNFORMATTED_VALUE" in msg
+    service.spreadsheets.assert_not_called()
 
 
-def test_date_time_render_option_validation() -> None:
-    sheets_service = MagicMock()
-
-    with pytest.raises(ValueError) as exc_info:
-        sheets_client.read_sheet_range(
-            sheets_service,
-            spreadsheet_id="sheet-123",
-            range_a1="Sheet1!A1:A2",
-            date_time_render_option="BAD_DATE",
-        )
-
-    msg = str(exc_info.value)
-    assert "Invalid date_time_render_option 'BAD_DATE'" in msg
-    assert "FORMATTED_STRING" in msg
-    assert "SERIAL_NUMBER" in msg
-
-
-def test_resolve_spreadsheet_id_by_pattern(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_spreadsheets_returns_normalized_reusable_references() -> None:
     drive_service = MagicMock()
-    drive_service.files.return_value.get.return_value.execute.return_value = {
-        "id": "abc1234567890XYZ___123",
-        "name": "My Sheet",
-        "mimeType": sheets_client.GOOGLE_SHEET_MIME,
-    }
-    monkeypatch.setattr(sheets_client, "authenticate", lambda: drive_service)
-
-    spreadsheet_id, title = sheets_client.resolve_spreadsheet_id(
-        "abc1234567890XYZ___123"
-    )
-
-    assert spreadsheet_id == "abc1234567890XYZ___123"
-    assert title == "My Sheet"
-    drive_service.files.return_value.get.assert_called_once()
-    drive_service.files.return_value.list.assert_not_called()
-
-
-def test_resolve_spreadsheet_id_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    drive_service = MagicMock()
-    drive_service.files.return_value.get.return_value.execute.side_effect = _http_404_error()
-    drive_service.files.return_value.list.return_value.execute.return_value = {
-        "files": [{"id": "sheet-1", "name": "Comps"}]
-    }
-    monkeypatch.setattr(sheets_client, "authenticate", lambda: drive_service)
-
-    spreadsheet_id, title = sheets_client.resolve_spreadsheet_id("Comps")
-
-    assert spreadsheet_id == "sheet-1"
-    assert title == "Comps"
-    list_kwargs = _files_list_call_args(drive_service)
-    assert list_kwargs["supportsAllDrives"] is True
-    assert list_kwargs["includeItemsFromAllDrives"] is True
-    assert "name = 'Comps'" in list_kwargs["q"]
-    assert sheets_client.GOOGLE_SHEET_MIME in list_kwargs["q"]
-
-
-def test_resolve_spreadsheet_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
-    drive_service = MagicMock()
-
-    def fake_get(*, fileId, **kwargs):
-        req = MagicMock()
-        if fileId in {"parent-1", "parent-2"}:
-            req.execute.return_value = {"id": fileId, "name": f"Folder {fileId[-1]}"}
-        else:
-            req.execute.side_effect = _http_404_error()
-        return req
-
-    drive_service.files.return_value.get.side_effect = fake_get
     drive_service.files.return_value.list.return_value.execute.return_value = {
         "files": [
             {
-                "id": "sheet-a",
-                "name": "Comps",
-                "modifiedTime": "2026-02-21T00:00:00Z",
-                "webViewLink": "https://docs.google.com/spreadsheets/d/sheet-a",
-                "parents": ["parent-1"],
-            },
-            {
-                "id": "sheet-b",
-                "name": "Comps",
-                "modifiedTime": "2026-02-22T00:00:00Z",
-                "webViewLink": "https://docs.google.com/spreadsheets/d/sheet-b",
-                "parents": ["parent-2"],
-            },
+                "id": SPREADSHEET_ID,
+                "name": "O'Reilly Comps",
+                "modifiedTime": "2026-07-14T12:00:00Z",
+                "webViewLink": f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}",
+            }
         ]
     }
-    monkeypatch.setattr(sheets_client, "authenticate", lambda: drive_service)
 
-    with pytest.raises(ValueError) as exc_info:
-        sheets_client.resolve_spreadsheet_id("Comps")
+    result = sheets_client.search_spreadsheets(
+        drive_service,
+        query="O'Reilly",
+        limit=5,
+    )
 
-    msg = str(exc_info.value)
-    assert "Multiple spreadsheets found" in msg
-    assert "sheet-a" in msg
-    assert "sheet-b" in msg
-
-
-def test_search_spreadsheets_filters_mime() -> None:
-    drive_service = MagicMock()
-    drive_service.files.return_value.list.return_value.execute.return_value = {
-        "files": []
-    }
-
-    sheets_client.search_spreadsheets(drive_service, query="Comp", max_results=5)
-
-    list_kwargs = _files_list_call_args(drive_service)
+    assert result == [
+        {
+            "spreadsheet": SPREADSHEET_ID,
+            "title": "O'Reilly Comps",
+            "url": f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}",
+            "modified_at": "2026-07-14T12:00:00Z",
+        }
+    ]
+    list_kwargs = drive_service.files.return_value.list.call_args.kwargs
+    assert "O\\'Reilly" in list_kwargs["q"]
     assert sheets_client.GOOGLE_SHEET_MIME in list_kwargs["q"]
     assert "trashed = false" in list_kwargs["q"]
+    assert list_kwargs["supportsAllDrives"] is True
+    assert list_kwargs["includeItemsFromAllDrives"] is True
     assert list_kwargs["pageSize"] == 5
 
 
-def test_search_spreadsheets_shared_drives() -> None:
-    drive_service = MagicMock()
-    drive_service.files.return_value.list.return_value.execute.return_value = {
-        "files": []
-    }
-
-    sheets_client.search_spreadsheets(drive_service, query="Comp")
-
-    list_kwargs = _files_list_call_args(drive_service)
-    assert list_kwargs["supportsAllDrives"] is True
-    assert list_kwargs["includeItemsFromAllDrives"] is True
-
-
-def test_search_spreadsheets_escapes_apostrophes() -> None:
-    drive_service = MagicMock()
-    drive_service.files.return_value.list.return_value.execute.return_value = {
-        "files": []
-    }
-
-    sheets_client.search_spreadsheets(drive_service, query="O'Reilly")
-
-    list_kwargs = _files_list_call_args(drive_service)
-    assert "O\\'Reilly" in list_kwargs["q"]
-
-
-def test_copy_spreadsheet_copies_all_tabs_and_renames_in_order() -> None:
-    sheets_service = MagicMock()
-    spreadsheets_api = sheets_service.spreadsheets.return_value
-    sheets_api = spreadsheets_api.sheets.return_value
-    call_order: list[str] = []
-
-    def fake_get(**kwargs):
-        call_order.append("get")
-        request = MagicMock()
-        request.execute.return_value = {
-            "sheets": [
-                {
-                    "properties": {
-                        "sheetId": 101,
-                        "title": "Comps",
-                        "index": 0,
-                        "gridProperties": {"rowCount": 20, "columnCount": 8},
-                    }
-                },
-                {
-                    "properties": {
-                        "sheetId": 102,
-                        "title": "Assumptions",
-                        "index": 1,
-                        "gridProperties": {"rowCount": 10, "columnCount": 4},
-                    }
-                },
-            ]
-        }
-        return request
-
-    def fake_create(**kwargs):
-        call_order.append("create")
-        request = MagicMock()
-        request.execute.return_value = {
-            "spreadsheetId": "new-sheet",
-            "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/new-sheet",
-            "sheets": [{"properties": {"sheetId": 900, "title": "Sheet1", "index": 0}}],
-        }
-        return request
-
-    copied_props = iter(
-        [
-            {"sheetId": 201, "title": "Copy of Comps", "index": 1},
-            {"sheetId": 202, "title": "Copy of Assumptions", "index": 2},
-        ]
-    )
-
-    def fake_copy_to(*, spreadsheetId, sheetId, body):
-        call_order.append(f"copyTo:{sheetId}")
-        request = MagicMock()
-        request.execute.return_value = next(copied_props)
-        return request
-
-    def fake_batch_update(**kwargs):
-        call_order.append("batchUpdate")
-        request = MagicMock()
-        request.execute.return_value = {}
-        return request
-
-    spreadsheets_api.get.side_effect = fake_get
-    spreadsheets_api.create.side_effect = fake_create
-    sheets_api.copyTo.side_effect = fake_copy_to
-    spreadsheets_api.batchUpdate.side_effect = fake_batch_update
-
-    result = sheets_client.copy_spreadsheet(
-        sheets_service,
-        source_spreadsheet_id="source-sheet",
-        new_title="[hank] HCM Comps",
-    )
-
-    assert call_order == ["get", "create", "copyTo:101", "copyTo:102", "batchUpdate"]
-    spreadsheets_api.create.assert_called_once_with(
-        body={"properties": {"title": "[hank] HCM Comps"}},
-        fields="spreadsheetId,spreadsheetUrl,properties(locale,timeZone),sheets(properties(sheetId,title,index))",
-    )
-    spreadsheets_api.batchUpdate.assert_called_once_with(
-        spreadsheetId="new-sheet",
-        body={
-            "requests": [
-                {"deleteSheet": {"sheetId": 900}},
-                {
-                    "updateSheetProperties": {
-                        "properties": {
-                            "sheetId": 201,
-                            "title": "Comps",
-                            "index": 0,
-                        },
-                        "fields": "title,index",
-                    }
-                },
-                {
-                    "updateSheetProperties": {
-                        "properties": {
-                            "sheetId": 202,
-                            "title": "Assumptions",
-                            "index": 1,
-                        },
-                        "fields": "title,index",
-                    }
-                },
-            ]
-        },
-    )
-    assert result == {
-        "spreadsheet_id": "new-sheet",
-        "title": "[hank] HCM Comps",
-        "url": "https://docs.google.com/spreadsheets/d/new-sheet",
-        "copied_tabs": ["Comps", "Assumptions"],
-        "warnings": [],
-    }
-
-
-def test_copy_spreadsheet_tabs_subset_preserves_source_order() -> None:
-    sheets_service = MagicMock()
-    spreadsheets_api = sheets_service.spreadsheets.return_value
-    sheets_api = spreadsheets_api.sheets.return_value
-    copied_sheet_ids: list[int] = []
-
-    spreadsheets_api.get.return_value.execute.return_value = {
-        "sheets": [
-            {"properties": {"sheetId": 11, "title": "Comps", "index": 0}},
-            {"properties": {"sheetId": 22, "title": "Summary", "index": 1}},
-            {"properties": {"sheetId": 33, "title": "Raw Data", "index": 2}},
-        ]
-    }
-    spreadsheets_api.create.return_value.execute.return_value = {
-        "spreadsheetId": "new-sheet",
-        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/new-sheet",
-        "sheets": [{"properties": {"sheetId": 90, "title": "Sheet1", "index": 0}}],
-    }
-    copied_props = iter(
-        [
-            {"sheetId": 111, "title": "Copy of Comps", "index": 1},
-            {"sheetId": 222, "title": "Copy of Summary", "index": 2},
-        ]
-    )
-
-    def fake_copy_to(*, spreadsheetId, sheetId, body):
-        copied_sheet_ids.append(sheetId)
-        request = MagicMock()
-        request.execute.return_value = next(copied_props)
-        return request
-
-    sheets_api.copyTo.side_effect = fake_copy_to
-
-    result = sheets_client.copy_spreadsheet(
-        sheets_service,
-        source_spreadsheet_id="source-sheet",
-        new_title="[hank] HCM Comps",
-        tabs=["Summary", "Comps"],
-    )
-
-    assert copied_sheet_ids == [11, 22]
-    assert result["copied_tabs"] == ["Comps", "Summary"]
-    batch_body = spreadsheets_api.batchUpdate.call_args.kwargs["body"]
-    assert batch_body["requests"][1]["updateSheetProperties"]["properties"] == {
-        "sheetId": 111,
-        "title": "Comps",
-        "index": 0,
-    }
-    assert batch_body["requests"][2]["updateSheetProperties"]["properties"] == {
-        "sheetId": 222,
-        "title": "Summary",
-        "index": 1,
-    }
-
-
-def test_clear_range_calls_api() -> None:
-    sheets_service = MagicMock()
-    clear_execute = (
-        sheets_service.spreadsheets.return_value.values.return_value.clear.return_value.execute
-    )
-    clear_execute.return_value = {"clearedRange": "Sheet1!A1:C10"}
-
-    result = sheets_client.clear_sheet_range(
-        sheets_service,
-        spreadsheet_id="sheet-123",
-        range_a1="Sheet1!A1:C10",
-    )
-
-    sheets_service.spreadsheets.return_value.values.return_value.clear.assert_called_once_with(
-        spreadsheetId="sheet-123",
-        range="Sheet1!A1:C10",
-        body={},
-    )
-    assert result["clearedRange"] == "Sheet1!A1:C10"
-
-
-def test_touch_sheet_range_reads_clears_and_rewrites_in_order() -> None:
-    sheets_service = MagicMock()
-    values_api = sheets_service.spreadsheets.return_value.values.return_value
-    call_order: list[str] = []
-
-    def _record_read():
-        call_order.append("read")
-        return {"values": [["=SF(\"AAPL\",\"income\",\"revenue\")", 42], ["foo", "bar"]]}
-
-    def _record_clear():
-        call_order.append("clear")
-        return {"clearedRange": "Sheet1!A1:B2"}
-
-    def _record_update():
-        call_order.append("update")
-        return {"updatedRange": "Sheet1!A1:B2", "updatedCells": 4}
-
-    values_api.get.return_value.execute.side_effect = _record_read
-    values_api.clear.return_value.execute.side_effect = _record_clear
-    values_api.update.return_value.execute.side_effect = _record_update
-
-    result = sheets_client.touch_sheet_range(
-        sheets_service,
-        spreadsheet_id="sheet-123",
-        range_a1="Sheet1!A1:B2",
-    )
-
-    assert call_order == ["read", "clear", "update"]
-    values_api.get.assert_called_once_with(
-        spreadsheetId="sheet-123",
-        range="Sheet1!A1:B2",
-        valueRenderOption="FORMULA",
-        dateTimeRenderOption="FORMATTED_STRING",
-    )
-    values_api.clear.assert_called_once_with(
-        spreadsheetId="sheet-123",
-        range="Sheet1!A1:B2",
-        body={},
-    )
-    values_api.update.assert_called_once_with(
-        spreadsheetId="sheet-123",
-        range="Sheet1!A1:B2",
-        valueInputOption="USER_ENTERED",
-        body={"values": [["=SF(\"AAPL\",\"income\",\"revenue\")", 42], ["foo", "bar"]]},
-    )
-    assert result == {"touchedRange": "Sheet1!A1:B2", "touchedCells": 4}
-
-
-def test_touch_sheet_range_empty_range_returns_without_writes() -> None:
-    sheets_service = MagicMock()
-    values_api = sheets_service.spreadsheets.return_value.values.return_value
-    values_api.get.return_value.execute.return_value = {"values": []}
-
-    result = sheets_client.touch_sheet_range(
-        sheets_service,
-        spreadsheet_id="sheet-123",
-        range_a1="Sheet1!A1:B2",
-    )
-
-    values_api.get.assert_called_once_with(
-        spreadsheetId="sheet-123",
-        range="Sheet1!A1:B2",
-        valueRenderOption="FORMULA",
-        dateTimeRenderOption="FORMATTED_STRING",
-    )
-    values_api.clear.assert_not_called()
-    values_api.update.assert_not_called()
-    assert result == {"touchedRange": "Sheet1!A1:B2", "touchedCells": 0}
-
-
-def _copy_service(named_ranges, source_props, copy_props):
+def _copy_service() -> MagicMock:
     service = MagicMock()
     spreadsheets = service.spreadsheets.return_value
-
-    def fake_get(*, spreadsheetId, fields):
-        assert "sheets(properties" in fields and "namedRanges(name)" in fields, (
-            "copy_spreadsheet must fetch tabs + spreadsheet-level metadata in ONE get"
-        )
-        request = MagicMock()
-        request.execute.return_value = {
-            "properties": source_props,
-            "namedRanges": [{"name": name} for name in named_ranges],
-            "sheets": [
-                {
-                    "properties": {
-                        "sheetId": 11,
-                        "title": "Tab1",
-                        "index": 0,
-                        "gridProperties": {"rowCount": 10, "columnCount": 5},
-                    }
+    spreadsheets.get.return_value.execute.return_value = {
+        "properties": {"locale": "en_US", "timeZone": "America/New_York"},
+        "namedRanges": [{"name": "RosterRange"}],
+        "sheets": [
+            {
+                "properties": {
+                    "sheetId": 101,
+                    "title": "Comps",
+                    "index": 0,
+                    "gridProperties": {"rowCount": 20, "columnCount": 8},
                 }
-            ],
-        }
-        return request
-
-    spreadsheets.get.side_effect = fake_get
-    spreadsheets.create.return_value.execute.return_value = {
-        "spreadsheetId": "new1234567890XYZ___12",
-        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/new1234567890XYZ___12",
-        "properties": copy_props,
-        "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1", "index": 0}}],
+            },
+            {
+                "properties": {
+                    "sheetId": 102,
+                    "title": "Assumptions",
+                    "index": 1,
+                    "gridProperties": {"rowCount": 10, "columnCount": 4},
+                }
+            },
+        ],
     }
-    spreadsheets.sheets.return_value.copyTo.return_value.execute.return_value = {
-        "sheetId": 77
+    spreadsheets.create.return_value.execute.return_value = {
+        "spreadsheetId": "destination-spreadsheet-id",
+        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/destination-spreadsheet-id",
+        "properties": {"locale": "en_GB", "timeZone": "UTC"},
+        "sheets": [{"properties": {"sheetId": 900, "title": "Sheet1", "index": 0}}],
     }
     spreadsheets.batchUpdate.return_value.execute.return_value = {}
     return service
 
 
-def test_copy_spreadsheet_warns_on_named_ranges_and_locale_mismatch() -> None:
-    service = _copy_service(
-        named_ranges=["RosterRange", "AnchorCells"],
-        source_props={"locale": "en_US", "timeZone": "America/New_York"},
-        copy_props={"locale": "en_GB", "timeZone": "Etc/GMT"},
+def test_copy_spreadsheet_returns_destination_and_structured_warnings() -> None:
+    service = _copy_service()
+    copied_properties = iter(
+        [
+            {"sheetId": 201, "title": "Copy of Comps", "index": 1},
+            {"sheetId": 202, "title": "Copy of Assumptions", "index": 2},
+        ]
+    )
+    service.spreadsheets.return_value.sheets.return_value.copyTo.return_value.execute.side_effect = (
+        lambda: next(copied_properties)
     )
 
-    result = sheets_client.copy_spreadsheet(service, "src1234567890XYZ___12", "copy")
-
-    assert len(result["warnings"]) == 3
-    assert "2 spreadsheet-level named range(s) NOT copied" in result["warnings"][0]
-    assert "AnchorCells, RosterRange" in result["warnings"][0]
-    assert "locale" in result["warnings"][1]
-    assert "time zone" in result["warnings"][2]
-
-
-def test_copy_spreadsheet_no_warnings_without_spreadsheet_level_gaps() -> None:
-    service = _copy_service(
-        named_ranges=[],
-        source_props={"locale": "en_US", "timeZone": "America/New_York"},
-        copy_props={"locale": "en_US", "timeZone": "America/New_York"},
+    result = sheets_client.copy_spreadsheet(
+        service,
+        SPREADSHEET_ID,
+        "[hank] Working Copy",
     )
 
-    result = sheets_client.copy_spreadsheet(service, "src1234567890XYZ___12", "copy")
+    assert result["spreadsheet"] == "destination-spreadsheet-id"
+    assert result["tabs"] == ["Comps", "Assumptions"]
+    assert [warning["code"] for warning in result["warnings"]] == [
+        "named_ranges_not_copied",
+        "locale_not_preserved",
+        "time_zone_not_preserved",
+    ]
+    batch_body = service.spreadsheets.return_value.batchUpdate.call_args.kwargs["body"]
+    assert batch_body["requests"][0] == {"deleteSheet": {"sheetId": 900}}
+    assert [
+        request["updateSheetProperties"]["properties"]["title"]
+        for request in batch_body["requests"][1:]
+    ] == ["Comps", "Assumptions"]
 
-    assert result["warnings"] == []
-    assert result["copied_tabs"] == ["Tab1"]
+
+def test_copy_partial_failure_preserves_destination_progress() -> None:
+    service = _copy_service()
+
+    def copy_to(*, spreadsheetId, sheetId, body):
+        del spreadsheetId, body
+        request = MagicMock()
+        if sheetId == 101:
+            request.execute.return_value = {"sheetId": 201}
+        else:
+            request.execute.side_effect = ConnectionError("response lost")
+        return request
+
+    service.spreadsheets.return_value.sheets.return_value.copyTo.side_effect = copy_to
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.copy_spreadsheet(
+            service,
+            SPREADSHEET_ID,
+            "[hank] Partial Copy",
+        )
+
+    error = exc_info.value
+    assert error.code == "operation_partial"
+    assert error.details["outcome_state"] == "partial"
+    assert error.details["mutation_may_have_occurred"] is True
+    assert error.details["retry_safe"] is False
+    assert error.details["retry_automatic"] is False
+    assert error.details["recovery"] == {
+        "kind": "copy_progress",
+        "destination_spreadsheet": "destination-spreadsheet-id",
+        "destination_url": "https://docs.google.com/spreadsheets/d/destination-spreadsheet-id",
+        "confirmed_tabs": ["Comps"],
+        "active_tab": "Assumptions",
+        "active_tab_state": "uncertain",
+        "remaining_tabs": ["Assumptions"],
+        "finalization_state": "not_started",
+    }
+
+
+def test_copy_source_failure_is_not_started_before_destination_creation() -> None:
+    service = MagicMock()
+    spreadsheets = service.spreadsheets.return_value
+    spreadsheets.get.return_value.execute.side_effect = ConnectionError("offline")
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.copy_spreadsheet(service, SPREADSHEET_ID, "Copy")
+
+    assert exc_info.value.details["outcome_state"] == "not_started"
+    assert exc_info.value.details["mutation_may_have_occurred"] is False
+    spreadsheets.create.assert_not_called()
+
+
+def test_copy_create_response_loss_is_uncertain_without_fabricated_destination() -> (
+    None
+):
+    service = _copy_service()
+    spreadsheets = service.spreadsheets.return_value
+    spreadsheets.create.return_value.execute.side_effect = ConnectionError(
+        "response lost"
+    )
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.copy_spreadsheet(service, SPREADSHEET_ID, "Copy")
+
+    assert exc_info.value.details["outcome_state"] == "uncertain"
+    assert exc_info.value.details["phase"] == "create_destination"
+    assert exc_info.value.details["recovery"] is None
+
+
+def test_copy_finalization_failure_preserves_confirmed_destination_progress() -> None:
+    service = _copy_service()
+    sheets_api = service.spreadsheets.return_value.sheets.return_value
+    copied_properties = iter([{"sheetId": 201}, {"sheetId": 202}])
+    sheets_api.copyTo.return_value.execute.side_effect = lambda: next(copied_properties)
+    service.spreadsheets.return_value.batchUpdate.return_value.execute.side_effect = (
+        ConnectionError("response lost")
+    )
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.copy_spreadsheet(service, SPREADSHEET_ID, "Copy")
+
+    error = exc_info.value
+    assert error.details["outcome_state"] == "partial"
+    assert error.details["phase"] == "finalize_destination"
+    assert error.details["recovery"] == {
+        "kind": "copy_progress",
+        "destination_spreadsheet": "destination-spreadsheet-id",
+        "destination_url": "https://docs.google.com/spreadsheets/d/destination-spreadsheet-id",
+        "confirmed_tabs": ["Comps", "Assumptions"],
+        "active_tab": None,
+        "active_tab_state": "not_started",
+        "remaining_tabs": [],
+        "finalization_state": "uncertain",
+    }
+
+
+def test_recalculate_blank_range_is_a_verified_noop() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    values.get.return_value.execute.return_value = {"values": [["", None], []]}
+
+    result = sheets_client.recalculate_sheet_range(
+        service,
+        SPREADSHEET_ID,
+        "Comps!A1:B2",
+    )
+
+    assert result == {
+        "range": "Comps!A1:B2",
+        "cell_count": 0,
+        "recovery_performed": False,
+        "formulas_verified": True,
+    }
+    values.clear.assert_not_called()
+    values.update.assert_not_called()
+
+
+def test_recalculate_literal_range_is_rejected_without_mutation() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    values.get.return_value.execute.return_value = {
+        "values": [["=SUM(A2:A3)", 42], ["", None]]
+    }
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.recalculate_sheet_range(
+            service,
+            SPREADSHEET_ID,
+            "Comps!A1:B2",
+        )
+
+    assert exc_info.value.code == "formula_range_required"
+    assert exc_info.value.details["outcome_state"] == "unchanged"
+    assert exc_info.value.details["mutation_may_have_occurred"] is False
+    values.clear.assert_not_called()
+    values.update.assert_not_called()
+
+
+def test_recalculate_formula_range_clears_restores_and_verifies_exactly() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    formulas = [["=SUM(A2:A3)", ""], [None, "=CUSTOM(B2)"]]
+    values.get.return_value.execute.side_effect = [
+        {"values": formulas},
+        {"values": formulas},
+    ]
+    values.clear.return_value.execute.return_value = {"clearedRange": "Comps!A1:B2"}
+    values.update.return_value.execute.return_value = {
+        "updatedRange": "Comps!A1:B2",
+        "updatedCells": 4,
+    }
+
+    result = sheets_client.recalculate_sheet_range(
+        service,
+        SPREADSHEET_ID,
+        "Comps!A1:B2",
+    )
+
+    assert result == {
+        "range": "Comps!A1:B2",
+        "cell_count": 2,
+        "recovery_performed": False,
+        "formulas_verified": True,
+    }
+    values.clear.assert_called_once_with(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Comps!A1:B2",
+        body={},
+    )
+    values.update.assert_called_once_with(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Comps!A1:B2",
+        valueInputOption="USER_ENTERED",
+        body={"values": formulas},
+    )
+    assert values.get.call_count == 2
+
+
+def test_recalculate_uses_one_exact_compensation_after_primary_write_failure() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    formulas = [["=CUSTOM(A1)"]]
+    values.get.return_value.execute.side_effect = [
+        {"values": formulas},
+        {"values": formulas},
+    ]
+    values.clear.return_value.execute.return_value = {"clearedRange": "Comps!A1"}
+    values.update.return_value.execute.side_effect = [
+        ConnectionError("primary write response lost"),
+        {"updatedRange": "Comps!A1", "updatedCells": 1},
+    ]
+
+    result = sheets_client.recalculate_sheet_range(
+        service,
+        SPREADSHEET_ID,
+        "Comps!A1",
+    )
+
+    assert result == {
+        "range": "Comps!A1",
+        "cell_count": 1,
+        "recovery_performed": True,
+        "formulas_verified": True,
+    }
+    assert values.update.call_count == 2
+    for call in values.update.call_args_list:
+        assert call.kwargs["body"] == {"values": formulas}
+        assert call.kwargs["range"] == "Comps!A1"
+
+
+def test_recalculate_uncertain_clear_enters_compensation_and_verifies() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    formulas = [["=CUSTOM(A1)"]]
+    values.get.return_value.execute.side_effect = [
+        {"values": formulas},
+        {"values": formulas},
+    ]
+    values.clear.return_value.execute.side_effect = ConnectionError(
+        "clear response lost"
+    )
+    values.update.return_value.execute.return_value = {
+        "updatedRange": "Comps!A1",
+        "updatedCells": 1,
+    }
+
+    result = sheets_client.recalculate_sheet_range(
+        service,
+        SPREADSHEET_ID,
+        "Comps!A1",
+    )
+
+    assert result["recovery_performed"] is True
+    assert result["formulas_verified"] is True
+    assert values.update.call_count == 1
+
+
+def test_recalculate_uncertain_clear_never_repeats_failed_compensation() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    formulas = [["=CUSTOM(A1)"]]
+    values.get.return_value.execute.return_value = {"values": formulas}
+    values.clear.return_value.execute.side_effect = ConnectionError(
+        "clear response lost"
+    )
+    values.update.return_value.execute.side_effect = ConnectionError(
+        "restore response lost"
+    )
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.recalculate_sheet_range(
+            service,
+            SPREADSHEET_ID,
+            "Comps!A1",
+        )
+
+    error = exc_info.value
+    assert error.code == "recalculation_recovery_failed"
+    assert error.details["outcome_state"] == "partial"
+    assert error.details["retry_safe"] is False
+    assert error.details["recovery"]["compensation_attempted"] is True
+    assert error.details["recovery"]["compensation_verified"] is False
+    assert values.update.call_count == 1
+    assert "CUSTOM" not in str(error)
+    assert "CUSTOM" not in str(error.details)
+
+
+def test_recalculate_proven_clear_rejection_never_runs_compensation() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    formulas = [["=CUSTOM(A1)"]]
+    values.get.return_value.execute.return_value = {"values": formulas}
+    values.clear.return_value.execute.side_effect = sheets_client.HttpError(
+        SimpleNamespace(status=400, reason="Bad Request"),
+        b"sensitive body",
+    )
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.recalculate_sheet_range(service, SPREADSHEET_ID, "Comps!A1")
+
+    assert exc_info.value.details["outcome_state"] == "unchanged"
+    assert exc_info.value.details["mutation_may_have_occurred"] is False
+    values.update.assert_not_called()
+
+
+def test_recalculate_verification_mismatch_runs_one_exact_compensation() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    formulas = [["=CUSTOM(A1)"]]
+    values.get.return_value.execute.side_effect = [
+        {"values": formulas},
+        {"values": [["=WRONG()"]]},
+        {"values": formulas},
+    ]
+    values.clear.return_value.execute.return_value = {"clearedRange": "Comps!A1"}
+    values.update.return_value.execute.return_value = {
+        "updatedRange": "Comps!A1",
+        "updatedCells": 1,
+    }
+
+    result = sheets_client.recalculate_sheet_range(
+        service,
+        SPREADSHEET_ID,
+        "Comps!A1",
+    )
+
+    assert result["recovery_performed"] is True
+    assert result["formulas_verified"] is True
+    assert values.update.call_count == 2
+    assert all(
+        call.kwargs["body"] == {"values": formulas}
+        for call in values.update.call_args_list
+    )
+
+
+def test_recalculate_failed_compensation_reports_partial_range_recovery() -> None:
+    service = MagicMock()
+    values = service.spreadsheets.return_value.values.return_value
+    formulas = [["=CUSTOM(A1)"]]
+    values.get.return_value.execute.return_value = {"values": formulas}
+    values.clear.return_value.execute.return_value = {"clearedRange": "Comps!A1"}
+    values.update.return_value.execute.side_effect = ConnectionError("write failed")
+
+    with pytest.raises(sheets_client.SheetsClientError) as exc_info:
+        sheets_client.recalculate_sheet_range(
+            service,
+            SPREADSHEET_ID,
+            "Comps!A1",
+        )
+
+    error = exc_info.value
+    assert error.code == "recalculation_recovery_failed"
+    assert error.details["outcome_state"] == "partial"
+    assert error.details["retry_safe"] is False
+    assert error.details["recovery"] == {
+        "kind": "range_state",
+        "spreadsheet": SPREADSHEET_ID,
+        "range": "Comps!A1",
+        "formula_cell_count": 1,
+        "compensation_attempted": True,
+        "compensation_verified": False,
+    }
+    assert values.update.call_count == 2
+    assert "CUSTOM" not in str(error)
+    assert "CUSTOM" not in str(error.details)
+
+
+def test_mutation_failure_distinguishes_rejected_from_uncertain() -> None:
+    rejected = sheets_client.HttpError(
+        SimpleNamespace(status=400, reason="Bad Request"),
+        b"bad request",
+    )
+    rejected_error = sheets_client.mutation_failure(
+        rejected,
+        phase="write_range",
+        dispatched=True,
+    )
+    uncertain_error = sheets_client.mutation_failure(
+        ConnectionError("response lost"),
+        phase="write_range",
+        dispatched=True,
+    )
+
+    assert rejected_error.details["outcome_state"] == "unchanged"
+    assert rejected_error.details["retry_safe"] is True
+    assert uncertain_error.details["outcome_state"] == "uncertain"
+    assert uncertain_error.details["retry_safe"] is False

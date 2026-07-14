@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
 import json
 import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -46,6 +48,43 @@ SAFETY_PARAMS = {
 }
 LEGACY_BYPASS_PARAMS = {"schedule_now", "send_now"}
 IGNORED_REQUIRED_PARAMS = {"self", "cls", "ctx", "context"}
+
+EXPECTED_LOCAL_TOOLS = (
+    "gsheets_list_tabs",
+    "gsheets_read_range",
+    "gsheets_write_range",
+    "gsheets_append_rows",
+    "gsheets_create_spreadsheet",
+    "gsheets_copy_spreadsheet",
+    "gsheets_search_spreadsheets",
+    "gsheets_clear_range",
+    "gsheets_recalculate_range",
+)
+EXPECTED_BROKER_TOOLS = tuple(
+    name for name in EXPECTED_LOCAL_TOOLS if name != "gsheets_search_spreadsheets"
+)
+EXPECTED_ANNOTATIONS = {
+    "gsheets_list_tabs": (True, False, True, True),
+    "gsheets_read_range": (True, False, True, True),
+    "gsheets_write_range": (False, True, False, True),
+    "gsheets_append_rows": (False, False, False, True),
+    "gsheets_create_spreadsheet": (False, False, False, True),
+    "gsheets_copy_spreadsheet": (False, False, False, True),
+    "gsheets_search_spreadsheets": (True, False, True, True),
+    "gsheets_clear_range": (False, True, True, True),
+    "gsheets_recalculate_range": (False, True, False, True),
+}
+REMOVED_TOOL_NAMES = {
+    "gsheet_list_tabs",
+    "gsheet_read_range",
+    "gsheet_update_range",
+    "gsheet_append_rows",
+    "gsheet_create",
+    "gsheet_copy_spreadsheet",
+    "gsheet_search",
+    "gsheet_clear_range",
+    "gsheet_touch_range",
+}
 
 
 @dataclass(frozen=True)
@@ -124,7 +163,8 @@ def _find_tools(tree: ast.AST) -> list[ToolFunction]:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         decorated = any(
-            is_mcp_tool(decorator) or _decorator_name(decorator) in structured_decorators
+            is_mcp_tool(decorator)
+            or _decorator_name(decorator) in structured_decorators
             for decorator in node.decorator_list
         )
         registration_lines = frozenset(registered.get(node.name, set()))
@@ -143,7 +183,8 @@ def _find_tools(tree: ast.AST) -> list[ToolFunction]:
                 start_line=start_line,
                 end_line=end_line,
                 registration_lines=registration_lines,
-                structured_error_envelope=module_structured_tool_wrapper or any(
+                structured_error_envelope=module_structured_tool_wrapper
+                or any(
                     _decorator_name(decorator) in structured_decorators
                     for decorator in node.decorator_list
                 ),
@@ -180,7 +221,10 @@ def _structured_tool_decorator_names(tree: ast.AST) -> set[str]:
             targets = [node.target]
         else:
             continue
-        if not isinstance(value, ast.Call) or _call_name(value.func) != "_structured_tool":
+        if (
+            not isinstance(value, ast.Call)
+            or _call_name(value.func) != "_structured_tool"
+        ):
             continue
         for target in targets:
             if isinstance(target, ast.Name):
@@ -208,7 +252,8 @@ def _module_structured_tool_wrapper(tree: ast.AST) -> bool:
         if wrapper is None:
             continue
         if any(
-            isinstance(call, ast.Call) and _call_name(call.func) == "_with_structured_error_envelope"
+            isinstance(call, ast.Call)
+            and _call_name(call.func) == "_with_structured_error_envelope"
             for call in ast.walk(wrapper)
         ):
             return True
@@ -269,7 +314,11 @@ def _lint_tool(path: Path, tool: ToolFunction, sibling_names: set[str]) -> list[
         )
 
     enum_values = _literal_enum_values(func)
-    if enum_values and not _doc_surfaces_enum_values(doc, enum_values) and "Literal[" not in body_src:
+    if (
+        enum_values
+        and not _doc_surfaces_enum_values(doc, enum_values)
+        and "Literal[" not in body_src
+    ):
         preview = ", ".join(sorted(enum_values)[:5])
         add(
             "warn",
@@ -278,7 +327,9 @@ def _lint_tool(path: Path, tool: ToolFunction, sibling_names: set[str]) -> list[
         )
 
     id_like_required = sorted(
-        param for param in required_params if param not in IGNORED_REQUIRED_PARAMS and ID_PARAM_RE.search(param)
+        param
+        for param in required_params
+        if param not in IGNORED_REQUIRED_PARAMS and ID_PARAM_RE.search(param)
     )
     if id_like_required and not DISCOVERY_RE.search(doc):
         add(
@@ -288,7 +339,9 @@ def _lint_tool(path: Path, tool: ToolFunction, sibling_names: set[str]) -> list[
         )
 
     near_siblings = sorted(
-        name for name in sibling_names if name != tool.name and _share_two_token_prefix(name, tool.name)
+        name
+        for name in sibling_names
+        if name != tool.name and _share_two_token_prefix(name, tool.name)
     )
     if near_siblings and not any(name in doc for name in near_siblings):
         add(
@@ -297,14 +350,20 @@ def _lint_tool(path: Path, tool: ToolFunction, sibling_names: set[str]) -> list[
             f"{tool.name}: near-name siblings {near_siblings[:3]} exist but docstring does not cross-reference them",
         )
 
-    if _returns_bare_string(func) and _raises_generic_error(func) and not _has_try_envelope(func):
+    if (
+        _returns_bare_string(func)
+        and _raises_generic_error(func)
+        and not _has_try_envelope(func)
+    ):
         add(
             "warn",
             "L-006",
             f"{tool.name}: returns a bare string and raises generic errors; prefer a structured error envelope",
         )
 
-    if _looks_mutating(tool.name, func) and not (tool.structured_error_envelope or _has_try_envelope(func)):
+    if _looks_mutating(tool.name, func) and not (
+        tool.structured_error_envelope or _has_try_envelope(func)
+    ):
         add(
             "warn",
             "L-007",
@@ -324,13 +383,16 @@ def _param_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
 
 def _has_wraps_decorator(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return any(
-        _call_name(decorator.func if isinstance(decorator, ast.Call) else decorator) == "wraps"
+        _call_name(decorator.func if isinstance(decorator, ast.Call) else decorator)
+        == "wraps"
         for decorator in func.decorator_list
     )
 
 
 def _is_preview_tool_name(name: str) -> bool:
-    return name.startswith("preview_") or name.endswith("_preview") or "_preview_" in name
+    return (
+        name.startswith("preview_") or name.endswith("_preview") or "_preview_" in name
+    )
 
 
 def _required_param_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
@@ -391,15 +453,24 @@ def _share_two_token_prefix(a: str, b: str) -> bool:
 
 
 def _returns_bare_string(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    if func.returns is not None and _safe_unparse(func.returns) in {"str", "builtins.str"}:
+    if func.returns is not None and _safe_unparse(func.returns) in {
+        "str",
+        "builtins.str",
+    }:
         return True
     for node in ast.walk(func):
         if not isinstance(node, ast.Return) or node.value is None:
             continue
         if isinstance(node.value, (ast.Constant, ast.JoinedStr)):
-            if isinstance(node.value, ast.JoinedStr) or isinstance(getattr(node.value, "value", None), str):
+            if isinstance(node.value, ast.JoinedStr) or isinstance(
+                getattr(node.value, "value", None), str
+            ):
                 return True
-        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "str":
+        if (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "str"
+        ):
             return True
     return False
 
@@ -413,13 +484,19 @@ def _raises_generic_error(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
             return True
         if isinstance(exc, ast.Call):
             exc = exc.func
-        if isinstance(exc, ast.Name) and exc.id in {"Exception", "RuntimeError", "ValueError"}:
+        if isinstance(exc, ast.Name) and exc.id in {
+            "Exception",
+            "RuntimeError",
+            "ValueError",
+        }:
             return True
     return False
 
 
 def _looks_mutating(name: str, func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    if name.startswith(("get_", "list_", "find_", "search_", "preview_", "show_", "read_")):
+    if name.startswith(
+        ("get_", "list_", "find_", "search_", "preview_", "show_", "read_")
+    ):
         return False
     if MUTATING_VERB_RE.search(name):
         return True
@@ -427,7 +504,19 @@ def _looks_mutating(name: str, func: ast.FunctionDef | ast.AsyncFunctionDef) -> 
         if not isinstance(node, ast.Call):
             continue
         called = _call_name(node.func)
-        if called in {"commit", "delete", "execute", "patch", "post", "put", "rename", "replace", "run", "unlink", "write"}:
+        if called in {
+            "commit",
+            "delete",
+            "execute",
+            "patch",
+            "post",
+            "put",
+            "rename",
+            "replace",
+            "run",
+            "unlink",
+            "write",
+        }:
             return True
     return False
 
@@ -475,7 +564,9 @@ def _is_ignored_path(path: Path) -> bool:
     return any(part in ignored_parts for part in path.parts)
 
 
-def staged_changed_lines(files: Sequence[Path], cwd: Path | None = None) -> dict[Path, set[int]]:
+def staged_changed_lines(
+    files: Sequence[Path], cwd: Path | None = None
+) -> dict[Path, set[int]]:
     """Return staged changed destination lines per file."""
     if not files:
         return {}
@@ -489,7 +580,9 @@ def staged_changed_lines(files: Sequence[Path], cwd: Path | None = None) -> dict
         *[str(path) for path in files],
     ]
     try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, check=False
+        )
     except OSError:
         return {}
     if result.returncode != 0:
@@ -497,7 +590,9 @@ def staged_changed_lines(files: Sequence[Path], cwd: Path | None = None) -> dict
     return _parse_unified_diff_changed_lines(result.stdout, cwd)
 
 
-def _parse_unified_diff_changed_lines(diff_text: str, cwd: Path) -> dict[Path, set[int]]:
+def _parse_unified_diff_changed_lines(
+    diff_text: str, cwd: Path
+) -> dict[Path, set[int]]:
     out: dict[Path, set[int]] = {}
     current: Path | None = None
     new_line: int | None = None
@@ -544,7 +639,9 @@ def _normalize_files(values: Iterable[str], root: Path, all_files: bool) -> list
     return out
 
 
-def run_lint(files: Sequence[Path], staged_only: bool = False, cwd: Path | None = None) -> list[Issue]:
+def run_lint(
+    files: Sequence[Path], staged_only: bool = False, cwd: Path | None = None
+) -> list[Issue]:
     cwd = cwd or Path.cwd()
     changes = staged_changed_lines(files, cwd=cwd) if staged_only else {}
     issues: list[Issue] = []
@@ -553,6 +650,248 @@ def run_lint(files: Sequence[Path], staged_only: bool = False, cwd: Path | None 
         if staged_only and not changed_lines:
             continue
         issues.extend(lint_file(path, changed_lines=changed_lines))
+    return issues
+
+
+def _registry_issue(root: Path, rule_id: str, tool: str, message: str) -> Issue:
+    return Issue(
+        severity="error",
+        rule_id=rule_id,
+        path=str(root / "src/gsheets_mcp/server.py"),
+        line=1,
+        tool=tool,
+        message=message,
+    )
+
+
+def _object_schemas_without_closed_world(schema: object, path: str = "$") -> list[str]:
+    failures: list[str] = []
+    if isinstance(schema, dict):
+        if (
+            schema.get("type") == "object"
+            and schema.get("additionalProperties") is not False
+        ):
+            failures.append(path)
+        for key, value in schema.items():
+            failures.extend(
+                _object_schemas_without_closed_world(value, f"{path}.{key}")
+            )
+    elif isinstance(schema, list):
+        for index, value in enumerate(schema):
+            failures.extend(
+                _object_schemas_without_closed_world(value, f"{path}[{index}]")
+            )
+    return failures
+
+
+def _schema_has_key(schema: object, target: str) -> bool:
+    if isinstance(schema, dict):
+        return target in schema or any(
+            _schema_has_key(value, target) for value in schema.values()
+        )
+    if isinstance(schema, list):
+        return any(_schema_has_key(value, target) for value in schema)
+    return False
+
+
+def lint_live_registry(root: Path) -> list[Issue]:
+    """Validate the executable registry and schemas without loading credentials."""
+    issues: list[Issue] = []
+    src_path = str(root / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+    try:
+        package = importlib.import_module("gsheets_mcp")
+        server_module = importlib.import_module("gsheets_mcp.server")
+        from pydantic import ValidationError
+    except Exception as exc:
+        return [
+            _registry_issue(
+                root,
+                "R-001",
+                "registry",
+                f"live registry could not be imported ({type(exc).__name__})",
+            )
+        ]
+
+    if package.__version__ != "1.0.0" or package.CONTRACT_VERSION != "1.0":
+        issues.append(
+            _registry_issue(
+                root,
+                "R-002",
+                "registry",
+                "package version must be 1.0.0 and wire contract must be 1.0",
+            )
+        )
+
+    try:
+        local_specs = server_module.tool_specs("local")
+        broker_specs = server_module.tool_specs("broker")
+    except Exception as exc:
+        issues.append(
+            _registry_issue(
+                root,
+                "R-003",
+                "registry",
+                f"credential-free registry construction failed ({type(exc).__name__})",
+            )
+        )
+        return issues
+
+    local_names = tuple(spec.name for spec in local_specs)
+    broker_names = tuple(spec.name for spec in broker_specs)
+    if local_names != EXPECTED_LOCAL_TOOLS:
+        issues.append(
+            _registry_issue(
+                root,
+                "R-004",
+                "registry",
+                "local mode must expose the exact nine-tool contract",
+            )
+        )
+    if broker_names != EXPECTED_BROKER_TOOLS:
+        issues.append(
+            _registry_issue(
+                root,
+                "R-005",
+                "registry",
+                "broker mode must expose exactly eight tools without search",
+            )
+        )
+    if REMOVED_TOOL_NAMES & set(local_names):
+        issues.append(
+            _registry_issue(
+                root, "R-006", "registry", "removed tool names remain executable"
+            )
+        )
+
+    for spec in local_specs:
+        definition = spec.definition()
+        input_schema = definition.inputSchema
+        output_schema = definition.outputSchema or {}
+        if _object_schemas_without_closed_world(input_schema):
+            issues.append(
+                _registry_issue(
+                    root,
+                    "R-007",
+                    spec.name,
+                    "input object schemas must recursively forbid unknown fields",
+                )
+            )
+        if _object_schemas_without_closed_world(output_schema):
+            issues.append(
+                _registry_issue(
+                    root,
+                    "R-008",
+                    spec.name,
+                    "output object schemas must recursively forbid unknown fields",
+                )
+            )
+        if output_schema.get("discriminator", {}).get("propertyName") != "status":
+            issues.append(
+                _registry_issue(
+                    root,
+                    "R-009",
+                    spec.name,
+                    "output schema must be a status-discriminated success/error union",
+                )
+            )
+        if _schema_has_key(output_schema, "result"):
+            issues.append(
+                _registry_issue(
+                    root, "R-010", spec.name, "generic result wrappers are forbidden"
+                )
+            )
+        expected = EXPECTED_ANNOTATIONS[spec.name]
+        actual = (
+            definition.annotations.readOnlyHint,
+            definition.annotations.destructiveHint,
+            definition.annotations.idempotentHint,
+            definition.annotations.openWorldHint,
+        )
+        if actual != expected:
+            issues.append(
+                _registry_issue(
+                    root,
+                    "R-011",
+                    spec.name,
+                    f"annotations {actual!r} do not match the canonical contract",
+                )
+            )
+        try:
+            spec.input_model.model_validate(
+                {**spec.example_arguments.model_dump(), "dry_run": True}
+            )
+        except ValidationError:
+            pass
+        else:
+            issues.append(
+                _registry_issue(
+                    root,
+                    "R-012",
+                    spec.name,
+                    "unknown safety fields must fail strict validation",
+                )
+            )
+
+    legacy_paths = (
+        root / "run_server.py",
+        root / "src/__init__.py",
+        root / "src/server.py",
+    )
+    for path in legacy_paths:
+        if path.exists():
+            issues.append(
+                _registry_issue(
+                    root,
+                    "R-013",
+                    "package",
+                    f"legacy runtime path still exists: {path.relative_to(root)}",
+                )
+            )
+
+    try:
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))[
+            "project"
+        ]
+        dependencies = set(project["dependencies"])
+        scripts = project["scripts"]
+    except (OSError, KeyError, tomllib.TOMLDecodeError, TypeError) as exc:
+        issues.append(
+            _registry_issue(
+                root,
+                "R-014",
+                "package",
+                f"pyproject contract could not be read ({type(exc).__name__})",
+            )
+        )
+    else:
+        if project.get("version") != "1.0.0":
+            issues.append(
+                _registry_issue(
+                    root, "R-015", "package", "pyproject version must be 1.0.0"
+                )
+            )
+        for dependency in {"mcp>=1.26.0,<2", "pydantic>=2.12,<3"}:
+            if dependency not in dependencies:
+                issues.append(
+                    _registry_issue(
+                        root,
+                        "R-016",
+                        "package",
+                        f"missing dependency constraint: {dependency}",
+                    )
+                )
+        if scripts.get("gsheets-mcp") != "gsheets_mcp.cli:main":
+            issues.append(
+                _registry_issue(
+                    root,
+                    "R-017",
+                    "package",
+                    "console entry point must target gsheets_mcp.cli:main",
+                )
+            )
+
     return issues
 
 
@@ -577,12 +916,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     root = Path.cwd()
     files = _normalize_files(args.files, root=root, all_files=args.all)
-    if not files:
-        return 0
-
-    issues = run_lint(files, staged_only=args.staged, cwd=root)
+    issues = lint_live_registry(root)
+    issues.extend(run_lint(files, staged_only=args.staged, cwd=root))
     if args.json:
-        print(json.dumps([issue.to_dict() for issue in issues], indent=2, sort_keys=True))
+        print(
+            json.dumps([issue.to_dict() for issue in issues], indent=2, sort_keys=True)
+        )
     else:
         for issue in issues:
             prefix = "ERROR" if issue.severity == "error" else "WARN"
