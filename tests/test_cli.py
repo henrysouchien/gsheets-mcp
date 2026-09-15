@@ -44,9 +44,8 @@ def test_version_is_the_exact_package_version_only() -> None:
     result = _run("--version")
 
     assert result.returncode == 0
-    assert result.stdout == "1.0.0\n"
+    assert result.stdout == f"{version('gsheets-mcp')}\n"
     assert result.stderr == ""
-    assert version("gsheets-mcp") == "1.0.0"
 
 
 def test_capabilities_json_is_credential_free_and_mode_specific() -> None:
@@ -71,7 +70,7 @@ def test_capabilities_json_is_credential_free_and_mode_specific() -> None:
     assert local_result.stderr == broker_result.stderr == ""
     local = json.loads(local_result.stdout)
     broker = json.loads(broker_result.stdout)
-    assert (local["package_version"], local["contract_version"]) == ("1.0.0", "1.0")
+    assert (local["package_version"], local["contract_version"]) == (version("gsheets-mcp"), "1.0")
     assert local["mode"] == "local"
     assert local["tool_count"] == 9
     assert broker["mode"] == "broker"
@@ -126,7 +125,7 @@ def test_installed_package_imports_from_neutral_directory(tmp_path: Path) -> Non
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["1.0.0", "gsheets_mcp"]
+    assert result.stdout.splitlines() == [version("gsheets-mcp"), "gsheets_mcp"]
     assert result.stderr == ""
 
 
