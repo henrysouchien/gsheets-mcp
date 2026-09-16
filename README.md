@@ -82,13 +82,12 @@ Prerequisites are Python 3.10+ and a Google Cloud OAuth desktop client with the
 Sheets and Drive APIs enabled.
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-python -m pip install -e .
+"$(uv python find --system --managed-python 3.13.15)" -m venv --copies venv
+venv/bin/python -m pip install -e .
 
-gsheets-mcp --help
-gsheets-mcp --version
-gsheets-mcp capabilities --json
+venv/bin/gsheets-mcp --help
+venv/bin/gsheets-mcp --version
+venv/bin/gsheets-mcp capabilities --json
 ```
 
 The bare command prints help and exits. Only `gsheets-mcp serve` starts the stdio
@@ -105,8 +104,7 @@ it with `GOOGLE_TOKEN_FILE`. Both files are ignored by Git.
 Run interactive consent once from a trusted local terminal:
 
 ```bash
-source venv/bin/activate
-python -c 'from gsheets_mcp.sheets_client import authenticate; authenticate()'
+venv/bin/python -c 'from gsheets_mcp.sheets_client import authenticate; authenticate()'
 ```
 
 Set `GSHEETS_HEADLESS=1` in non-interactive environments so missing consent fails
@@ -133,8 +131,8 @@ Drive title search is intentionally absent. Do not put broker tokens in tracked
 configuration or command arguments.
 
 ```bash
-GSHEETS_TOKEN_MODE=broker gsheets-mcp capabilities --json
-GSHEETS_TOKEN_MODE=broker gsheets-mcp serve
+GSHEETS_TOKEN_MODE=broker venv/bin/gsheets-mcp capabilities --json
+GSHEETS_TOKEN_MODE=broker venv/bin/gsheets-mcp serve
 ```
 
 An invalid mode fails closed. Broker credentials refresh proactively near expiry,
@@ -143,10 +141,9 @@ and Google 401 handling is bounded to one exact-request credential refresh.
 ## Development
 
 ```bash
-source venv/bin/activate
-python -m pip install -e '.[dev]'
-python -m pytest -q
-python scripts/mcp_lint.py
+venv/bin/python -m pip install -e '.[dev]'
+venv/bin/python -m pytest -q
+venv/bin/python scripts/mcp_lint.py
 ```
 
 The lint command imports the live registry without credentials and verifies the
