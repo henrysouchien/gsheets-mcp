@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import jsonschema
 import pytest
 from mcp import ClientSession, types
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from pydantic import TypeAdapter
 
 from gsheets_mcp import __version__
 from gsheets_mcp import server as server_module
@@ -123,7 +125,7 @@ def test_discovery_exposes_only_canonical_strict_input_schemas() -> None:
         assert schema["additionalProperties"] is False
         assert set(schema["properties"]) == EXPECTED_INPUT_FIELDS[tool.name]
         assert tool.outputSchema is not None
-        assert tool.outputSchema.get("type") != "string"
+        assert tool.outputSchema["type"] == "object"
         assert tool.annotations is not None
         assert (
             tool.annotations.readOnlyHint,
@@ -141,7 +143,8 @@ def test_discovery_exposes_only_canonical_strict_input_schemas() -> None:
 
 def _assert_recursive_objects_are_closed(schema: object) -> None:
     if isinstance(schema, dict):
-        if schema.get("type") == "object":
+        # A union is closed by its object variants, not by the composition root.
+        if schema.get("type") == "object" and "oneOf" not in schema:
             assert schema.get("additionalProperties") is False
         for value in schema.values():
             _assert_recursive_objects_are_closed(value)
@@ -181,6 +184,16 @@ def test_output_schema_requires_wire_discriminators_and_operation() -> None:
             missing = {key: value for key, value in payload.items() if key != required_key}
             with pytest.raises(jsonschema.ValidationError):
                 jsonschema.validate(missing, definition.outputSchema)
+
+
+def test_output_schema_rejects_non_object_variants() -> None:
+    spec = server_module.all_tool_specs()[0]
+    non_object_result = replace(
+        spec, result_adapter=TypeAdapter(ListTabsSuccess | str)
+    )
+
+    with pytest.raises(ValueError, match="output schema variants must be objects"):
+        non_object_result.definition()
 
 
 @pytest.mark.parametrize(

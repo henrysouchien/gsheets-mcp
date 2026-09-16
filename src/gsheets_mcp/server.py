@@ -54,16 +54,27 @@ class ToolSpec:
     mutation_class: str
 
     def definition(self) -> types.Tool:
+        # Serialization mode requires defaulted discriminator fields that are
+        # always present on the wire, such as status and operation.
+        output_schema = self.result_adapter.json_schema(mode="serialization")
+        variants = output_schema.get(
+            "oneOf", output_schema.get("anyOf", [output_schema])
+        )
+        for variant in variants:
+            if "$ref" in variant:
+                variant = output_schema["$defs"][
+                    variant["$ref"].removeprefix("#/$defs/")
+                ]
+            if variant.get("type") != "object":
+                raise ValueError(f"{self.name} output schema variants must be objects")
+        # MCP requires an explicit root type even for a union of object schemas.
+        output_schema["type"] = "object"
         return types.Tool(
             name=self.name,
             title=self.title,
             description=self.description,
             inputSchema=self.input_model.model_json_schema(),
-            # Results are serialized model instances, so defaulted discriminator
-            # fields such as status and operation are always present on the wire.
-            # Serialization mode keeps the advertised schema exact by requiring
-            # those fields instead of merely documenting their defaults.
-            outputSchema=self.result_adapter.json_schema(mode="serialization"),
+            outputSchema=output_schema,
             annotations=self.annotations,
             _meta={
                 "gsheets/contractVersion": CONTRACT_VERSION,
